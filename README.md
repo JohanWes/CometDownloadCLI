@@ -76,6 +76,7 @@ In the `/jobs` view, use the arrow keys to select a job, `Enter` to open the can
 
 - downloads go to `~/Downloads` by default unless overridden
 - files are saved for local playback; this tool does not stream them
+- cancelled jobs remove their temporary in-progress download folder so partial files do not linger
 - if the upstream filename is generic, the CLI falls back to a cleaner local filename
 
 ## Troubleshooting

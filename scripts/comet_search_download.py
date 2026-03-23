@@ -199,6 +199,7 @@ class DownloadJob:
     host: str
     candidate: StreamCandidate
     output_dir: Path
+    staging_dir: Path
     fallback_name: str
     status: str = "queued"
     phase: str = "Queued"
@@ -1163,6 +1164,19 @@ class JobReporter:
     def finish_file(self, destination: Path, completed_files: int, total_files: int) -> None:
         self._manager.finish_file(self._job_id, destination, completed_files, total_files)
 
+    def set_finalizing(self) -> None:
+        self._manager.update_job(
+            self._job_id,
+            status="downloading",
+            phase="Finalizing files",
+            current_file_index=None,
+            current_file_name="",
+            downloaded_bytes=0,
+            total_bytes=None,
+            speed_bytes_per_second=0.0,
+            eta_seconds=None,
+        )
+
 
 class DownloadManager:
     def __init__(
@@ -1205,6 +1219,7 @@ class DownloadManager:
                 host=host,
                 candidate=candidate,
                 output_dir=output_dir,
+                staging_dir=build_staging_dir(output_dir, job_id),
                 fallback_name=fallback_name,
             )
             self._jobs[job_id] = job
@@ -1235,17 +1250,25 @@ class DownloadManager:
             reporter = JobReporter(self, job_id)
             try:
                 reporter.set_resolving()
-                destinations = download_selected_stream(
+                staged_destinations = download_selected_stream(
                     job.host,
                     job.candidate,
-                    job.output_dir,
+                    job.staging_dir,
                     job.fallback_name,
                     reporter=reporter,
                     cancel_event=job.cancel_event,
                 )
+                reporter.set_finalizing()
+                destinations = finalize_downloaded_files(
+                    staged_destinations,
+                    job.staging_dir,
+                    job.output_dir,
+                )
             except DownloadCancelled:
+                cleanup_download_dir(job.staging_dir)
                 self._mark_cancelled(job_id, "Cancelled")
             except Exception as error:
+                cleanup_download_dir(job.staging_dir)
                 self._mark_failed(job_id, str(error))
             else:
                 self._mark_completed(job_id, destinations)
@@ -1259,7 +1282,6 @@ class DownloadManager:
     def finish_file(self, job_id: int, destination: Path, completed_files: int, total_files: int) -> None:
         with self._lock:
             job = self._jobs[job_id]
-            job.destinations.append(destination)
             job.completed_files = completed_files
             job.total_files = total_files
             job.current_file_name = ""
@@ -1286,6 +1308,7 @@ class DownloadManager:
                     self._queued_job_ids.remove(job_id)
                 except ValueError:
                     pass
+                cleanup_download_dir(job.staging_dir)
                 job.status = "cancelled"
                 job.phase = "Cancelled"
                 job.finished_at = time.time()
@@ -1369,8 +1392,7 @@ class DownloadManager:
     def _mark_completed(self, job_id: int, destinations: list[Path]) -> None:
         with self._lock:
             job = self._jobs[job_id]
-            if not job.destinations:
-                job.destinations.extend(destinations)
+            job.destinations = list(destinations)
             job.status = "completed"
             job.phase = "Completed"
             job.finished_at = time.time()
@@ -2066,6 +2088,10 @@ def build_collection_dir_name(media: MediaCandidate, season: int | None = None) 
     return sanitize_filename(" ".join(parts))
 
 
+def build_staging_dir(output_dir: Path, job_id: int) -> Path:
+    return output_dir.parent / f".{output_dir.name}.job-{job_id}.partial"
+
+
 def extract_filename(headers, fallback_name: str, fallback_ext: str = ".mkv") -> str:
     header = headers.get("Content-Disposition", "")
     match = CONTENT_DISPOSITION_FILENAME.search(header)
@@ -2087,6 +2113,30 @@ def reserve_destination_path(output_dir: Path, filename: str) -> tuple[Path, Pat
         destination = destination.with_name(f"{destination.stem} ({suffix}){destination.suffix}")
         suffix += 1
     return destination, destination.with_name(f"{destination.name}.part")
+
+
+def cleanup_download_dir(path: Path) -> None:
+    if not path.exists():
+        return
+    if path.is_dir():
+        shutil.rmtree(path, ignore_errors=True)
+        return
+    path.unlink(missing_ok=True)
+
+
+def finalize_downloaded_files(
+    staged_paths: list[Path],
+    staging_dir: Path,
+    output_dir: Path,
+) -> list[Path]:
+    output_dir.mkdir(parents=True, exist_ok=True)
+    finalized_paths: list[Path] = []
+    for staged_path in staged_paths:
+        destination, _ = reserve_destination_path(output_dir, staged_path.name)
+        shutil.move(str(staged_path), str(destination))
+        finalized_paths.append(destination)
+    cleanup_download_dir(staging_dir)
+    return finalized_paths
 
 
 def download_from_url_with_progress(
