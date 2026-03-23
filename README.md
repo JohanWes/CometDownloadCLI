@@ -1,129 +1,88 @@
 # Comet Search Download
 
-This repository is now a single-purpose local downloader built around [`scripts/comet_search_download.py`](/home/johanw/repos/comet/scripts/comet_search_download.py).
+I needed a good CLI-based option to download files with fast Real-Debrid downloads for offline use, plane trips, and similar cases, so I built this tool from a fork of Comet.
 
-The script:
+This project has nothing to do with Stremio-style streaming. It does not stream video files. It searches, queues, and downloads them with a clean terminal UI, and you need to supply your own Real-Debrid API key.
 
-- stores and reuses your `REALDEBRID_API_TOKEN` in `.env`
-- starts the local backend automatically when needed
-- searches movies and TV shows by title
-- lets you choose a movie, an episode, or a season search
-- shows top 4K and 1080p results, preferring movies and episodes at 4K 3-10 GB and 1080p 1-5 GB, with wider bands for full seasons
-- downloads the selected result to the OS Downloads folder by default:
-  Linux uses `~/Downloads`, Windows uses `%USERPROFILE%\Downloads`
-- creates a per-title folder such as `~/Downloads/<Title> (<Year>)/` for movies and `~/Downloads/<Title> Season 01 (<Year>)/` for series downloads
-- ignores old temp-directory defaults such as `/tmp/...` and falls back to the OS Downloads folder instead
-- downloads every matching episode file for full-season selections
-- shows progress percent, speed, and ETA
-- loops back to a new search after each completed download
-- falls back to human-friendly filenames such as `Inception (2010) 2160p.mkv`
+## What It Does
+
+- searches movies and series by title
+- lets you pick a movie, single episode, or full season
+- queues downloads and keeps the CLI usable while downloads run
+- shows active, queued, and finished jobs in a live sidebar on Rich-capable terminals
+- downloads files to your local machine for offline use
 
 ## Requirements
 
-- Linux or macOS shell environment
+- Linux or macOS shell
 - Python 3.13+
-- A Real-Debrid account and API token
-- Network access to:
-  - TMDB, for title search in the CLI script
-  - `stremthru.13377001.xyz`, for torrent search/cache/link generation
+- Python `venv` support
+- `git`
+- a Real-Debrid account and API token
 
-## Setup
+## Quick Start
 
-Create a virtual environment and install the project:
+From the repo root:
 
 ```bash
-python -m venv .venv
-./.venv/bin/pip install -e .
+./cometCLI
 ```
 
-Create `.env` from [`.env-sample`](/home/johanw/repos/comet/.env-sample) and set at least:
+On first run, `./cometCLI` will create `.venv` if needed, install dependencies, and launch the downloader.
+
+Create `.env` from [`.env-sample`](/home/johanw/repos/comet/.env-sample) and set:
 
 ```dotenv
 REALDEBRID_API_TOKEN=your_token_here
 ```
 
-Optional `.env` values:
+## Useful Commands
 
-- `COMET_DOWNLOAD_DIR=/path/to/downloads`
-- `PUBLIC_API_TOKEN=your_prefix_token`
-- `FASTAPI_HOST=127.0.0.1`
-- `FASTAPI_PORT=8000`
-- `STREMTHRU_URL=https://stremthru.13377001.xyz`
-
-## Run
-
-Run the downloader directly:
+Run the CLI:
 
 ```bash
-./.venv/bin/python scripts/comet_search_download.py
+./cometCLI
 ```
 
 Useful options:
 
 ```bash
-./.venv/bin/python scripts/comet_search_download.py --query "Inception"
-./.venv/bin/python scripts/comet_search_download.py --restart-comet
-./.venv/bin/python scripts/comet_search_download.py --output-dir ~/Downloads
+./cometCLI --query "Example Title"
+./cometCLI --restart-comet
+./cometCLI --output-dir ~/Downloads
+./cometCLI --parallel-downloads 3
 ```
 
-The script starts the local backend by launching:
+Inside the live CLI:
 
-```bash
-python -m comet.main
+```text
+/jobs
+/clear-finished
+/help
+/quit
 ```
 
-You can also start the backend manually:
+In the `/jobs` view, use the arrow keys to select a job, `Enter` to open the cancel prompt, and `Esc` or `q` to return to normal search mode.
 
-```bash
-./.venv/bin/python -m comet.main
-```
+## How It Works
 
-## How `.env` Is Used
+1. Search for a title.
+2. Pick a movie, episode, or full season.
+3. Choose one of the filtered 4K or 1080p results.
+4. The download is queued immediately.
+5. Background workers resolve links and download the files locally.
 
-- `REALDEBRID_API_TOKEN` is read by the script and saved automatically the first time you enter it.
-- `COMET_DOWNLOAD_DIR` is reused as the default destination if set.
-- `--output-dir` only applies to the current run and does not update `.env`.
-- `PUBLIC_API_TOKEN` adds an optional `/s/<token>` API prefix. The script uses it automatically if present.
-- Backend host and port come from `FASTAPI_HOST` and `FASTAPI_PORT`.
+## Notes
 
-## How Downloads Work
-
-1. The CLI searches TMDB by title and lets you pick a movie or show.
-2. The local backend searches StremThru’s Torznab feed by IMDb ID.
-3. Results are filtered to 4K and 1080p, with preferred size bands of 3-10 GB for 4K and 1-5 GB for 1080p for movies and episodes, and doubled bands for full-season searches, then cache-checked against your Real-Debrid account.
-4. When you choose a result, the backend adds the magnet through StremThru and generates Real-Debrid download links for the matching file or files.
-5. The CLI downloads the file locally and shows progress percent, speed, and ETA.
-6. If the upstream filename is generic, the CLI falls back to a readable local name.
-
-## Restart Or Reset
-
-Restart the backend from the script:
-
-```bash
-./.venv/bin/python scripts/comet_search_download.py --restart-comet
-```
-
-Stop it manually:
-
-```bash
-pkill -f "comet.main"
-```
-
-Reset local runtime artifacts:
-
-```bash
-rm -f data/comet_search_download.log
-```
+- downloads go to `~/Downloads` by default unless overridden
+- files are saved for local playback; this tool does not stream them
+- if the upstream filename is generic, the CLI falls back to a cleaner local filename
 
 ## Troubleshooting
 
-- `Could not find a Python environment that can run Comet`
-  - Install the project into `.venv` and run the script with `./.venv/bin/python`.
 - `Comet did not become healthy`
   - Check [`data/comet_search_download.log`](/home/johanw/repos/comet/data/comet_search_download.log).
 - `No streams matched`
-  - The selected title may not have suitable 4K/1080p English-friendly results at that moment.
+  - The selected title may not have suitable cached results right now.
 - `The selected torrent is not cached yet`
-  - Pick a result marked `cached` in the CLI output.
-- Download filename looks generic
-  - The script will automatically fall back to a readable name based on the chosen title and resolution.
+  - Pick a result marked `cached`.

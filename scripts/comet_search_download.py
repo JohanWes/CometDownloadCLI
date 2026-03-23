@@ -4,18 +4,54 @@ import base64
 import json
 import os
 import re
+import select
 import shutil
 import subprocess
 import sys
 import tempfile
+import threading
 import time
-from dataclasses import dataclass
+import urllib.request
+from collections import deque
+from contextlib import nullcontext
+from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 from urllib.error import HTTPError, URLError
 from urllib.parse import urlencode, urljoin
 from urllib.request import Request, urlopen
-import urllib.request
+
+if os.name == "posix":
+    import termios
+else:  # pragma: no cover - platform-specific branch
+    termios = None
+
+try:
+    from rich import box
+    from rich.console import Console, Group
+    from rich.layout import Layout
+    from rich.live import Live
+    from rich.markup import escape
+    from rich.panel import Panel
+    from rich.table import Table
+    from rich.text import Text
+    from rich.theme import Theme
+
+    RICH_AVAILABLE = True
+except ImportError:  # pragma: no cover - optional dependency fallback
+    box = None
+    Console = None
+    Group = None
+    Layout = None
+    Live = None
+    Panel = None
+    Table = None
+    Text = None
+    Theme = None
+    RICH_AVAILABLE = False
+
+    def escape(value: str) -> str:
+        return value
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
@@ -87,6 +123,1306 @@ class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
         return None
 
 
+class InputShield:
+    def __init__(self) -> None:
+        self._fd: int | None = None
+        self._old_settings: Any = None
+        self._enabled = False
+
+    def __enter__(self) -> "InputShield":
+        if os.name != "posix" or termios is None or not sys.stdin.isatty():
+            return self
+
+        try:
+            fd = sys.stdin.fileno()
+            old_settings = termios.tcgetattr(fd)
+            new_settings = termios.tcgetattr(fd)
+            new_settings[3] &= ~(termios.ECHO | termios.ICANON)
+            new_settings[6][termios.VMIN] = 0
+            new_settings[6][termios.VTIME] = 0
+            termios.tcsetattr(fd, termios.TCSANOW, new_settings)
+            termios.tcflush(fd, termios.TCIFLUSH)
+        except (AttributeError, OSError, ValueError):
+            return self
+
+        self._fd = fd
+        self._old_settings = old_settings
+        self._enabled = True
+        return self
+
+    def drain(self) -> None:
+        if not self._enabled or self._fd is None:
+            return
+
+        while True:
+            try:
+                ready, _, _ = select.select([self._fd], [], [], 0)
+            except (OSError, ValueError):
+                return
+
+            if not ready:
+                return
+
+            try:
+                chunk = os.read(self._fd, 1024)
+            except OSError:
+                return
+
+            if not chunk:
+                return
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        self.drain()
+
+        if self._enabled and self._fd is not None and self._old_settings is not None:
+            try:
+                termios.tcsetattr(self._fd, termios.TCSANOW, self._old_settings)
+            except (AttributeError, OSError, ValueError):
+                pass
+
+            try:
+                termios.tcflush(self._fd, termios.TCIFLUSH)
+            except (AttributeError, OSError, ValueError):
+                pass
+
+        return False
+
+
+class DownloadCancelled(Exception):
+    pass
+
+
+@dataclass
+class DownloadJob:
+    job_id: int
+    label: str
+    host: str
+    candidate: StreamCandidate
+    output_dir: Path
+    fallback_name: str
+    status: str = "queued"
+    phase: str = "Queued"
+    created_at: float = field(default_factory=time.time)
+    started_at: float | None = None
+    finished_at: float | None = None
+    total_files: int = 1
+    completed_files: int = 0
+    current_file_index: int | None = None
+    current_file_name: str = ""
+    total_bytes: int | None = None
+    downloaded_bytes: int = 0
+    speed_bytes_per_second: float = 0.0
+    eta_seconds: float | None = None
+    destinations: list[Path] = field(default_factory=list)
+    error_text: str = ""
+    cancel_requested: bool = False
+    cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
+
+
+@dataclass(frozen=True)
+class DownloadJobSnapshot:
+    job_id: int
+    label: str
+    status: str
+    phase: str
+    created_at: float
+    started_at: float | None
+    finished_at: float | None
+    total_files: int
+    completed_files: int
+    current_file_index: int | None
+    current_file_name: str
+    total_bytes: int | None
+    downloaded_bytes: int
+    speed_bytes_per_second: float
+    eta_seconds: float | None
+    destinations: tuple[Path, ...]
+    error_text: str
+    cancel_requested: bool
+    output_dir: Path
+
+
+class DashboardRenderable:
+    def __init__(self, ui: "TerminalUI") -> None:
+        self._ui = ui
+
+    def __rich__(self):
+        return self._ui.build_layout()
+
+
+class UIStatus:
+    def __init__(self, ui: "TerminalUI", message: str) -> None:
+        self._ui = ui
+        self._message = message
+        self._fallback = nullcontext()
+
+    def __enter__(self):
+        if self._ui.live_enabled():
+            self._ui.set_status_message(self._message)
+            return self
+
+        if self._ui.console:
+            self._fallback = self._ui.console.status(
+                f"[accent]{escape(self._message)}[/accent]",
+                spinner="dots",
+                spinner_style="accent_soft",
+            )
+        self._fallback.__enter__()
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        if self._ui.live_enabled():
+            self._ui.clear_status_message(self._message)
+            return False
+        return self._fallback.__exit__(exc_type, exc, tb)
+
+
+class TerminalUI:
+    def __init__(self) -> None:
+        self.console = None
+        if RICH_AVAILABLE and sys.stdout.isatty():
+            self.console = Console(
+                theme=Theme(
+                    {
+                        "accent": "bold #86c8bc",
+                        "accent_soft": "#aacfc8",
+                        "heading": "bold #f4efe6",
+                        "muted": "#98a4ad",
+                        "panel": "#5e7f86",
+                        "success": "bold #88b26f",
+                        "warning": "bold #d2aa61",
+                        "error": "bold #d97979",
+                        "bar.back": "#2a3137",
+                        "bar.complete": "bold #86c8bc",
+                        "bar.finished": "bold #88b26f",
+                        "bar.pulse": "#aacfc8",
+                    }
+                ),
+                highlight=False,
+                soft_wrap=True,
+            )
+        self._supports_live = (
+            self.console is not None
+            and Live is not None
+            and Layout is not None
+            and sys.stdin.isatty()
+            and os.name == "posix"
+            and termios is not None
+        )
+        self._live: Live | None = None
+        self._main_renderable = None
+        self._event_messages: deque[tuple[str, str]] = deque(maxlen=12)
+        self._status_messages: list[str] = []
+        self._prompt_label = ""
+        self._prompt_buffer = ""
+        self._input_mode = "query"
+        self._job_browser_selected_id: int | None = None
+        self._job_browser_notice = ""
+        self._download_manager: DownloadManager | None = None
+        self._lock = threading.RLock()
+
+    def bind_download_manager(self, manager: "DownloadManager") -> None:
+        self._download_manager = manager
+
+    def rich_enabled(self) -> bool:
+        return self.console is not None
+
+    def live_enabled(self) -> bool:
+        return self._live is not None
+
+    def start_session(self) -> None:
+        if not self._supports_live or self._live is not None:
+            return
+        self._live = Live(
+            DashboardRenderable(self),
+            console=self.console,
+            auto_refresh=True,
+            refresh_per_second=6,
+            transient=False,
+        )
+        self._live.start()
+        self.refresh()
+
+    def stop_session(self) -> None:
+        if self._live is None:
+            return
+        live = self._live
+        self._live = None
+        live.stop()
+
+    def refresh(self) -> None:
+        if self._live is not None:
+            self._live.refresh()
+
+    def _set_main_renderable(self, renderable) -> None:
+        with self._lock:
+            self._main_renderable = renderable
+        if not self.live_enabled() and self.console:
+            self.console.print()
+            self.console.print(renderable)
+        self.refresh()
+
+    def _append_event(self, level: str, message: str) -> None:
+        with self._lock:
+            self._event_messages.append((level, message))
+        self.refresh()
+
+    def set_status_message(self, message: str) -> None:
+        with self._lock:
+            self._status_messages.append(message)
+        self.refresh()
+
+    def clear_status_message(self, message: str) -> None:
+        with self._lock:
+            for index in range(len(self._status_messages) - 1, -1, -1):
+                if self._status_messages[index] == message:
+                    self._status_messages.pop(index)
+                    break
+        self.refresh()
+
+    def show_header(self) -> None:
+        if self.live_enabled():
+            self.show_help()
+            return
+
+        if not self.console:
+            print("Comet Search Download")
+            print("Search, select, queue, repeat.")
+            return
+
+        self.console.print(
+            Panel.fit(
+                "[heading]Comet Search Download[/heading]\n[muted]Search, select, queue, repeat.[/muted]",
+                border_style="panel",
+                padding=(1, 2),
+            )
+        )
+
+    def blank(self) -> None:
+        if not self.live_enabled():
+            if self.console:
+                self.console.print()
+            else:
+                print()
+
+    def prompt(self, prompt: str) -> str:
+        if self.live_enabled():
+            return self._prompt_live(prompt)
+        if self.console:
+            return self.console.input(f"[accent]{escape(prompt)}[/accent]")
+        return input(prompt)
+
+    def show_jobs(self, jobs: list[DownloadJobSnapshot]) -> None:
+        if not jobs:
+            if self.live_enabled():
+                self.info("No downloads in this session yet.")
+                self._exit_job_browser()
+            elif not self.console:
+                self.info("No downloads in this session yet.")
+            else:
+                self._set_main_renderable(
+                    Panel(
+                        "[muted]No downloads in this session yet.[/muted]",
+                        title="[heading]Jobs[/heading]",
+                        border_style="panel",
+                        padding=(1, 2),
+                    )
+                )
+            return
+
+        if self.live_enabled():
+            with self._lock:
+                self._input_mode = "jobs"
+                self._job_browser_notice = "Use Up/Down to select a job. Enter opens cancel confirmation. Esc/q returns to search."
+                if self._job_browser_selected_id not in {job.job_id for job in jobs}:
+                    self._job_browser_selected_id = jobs[0].job_id
+            self.refresh()
+            return
+
+        if not self.console:
+            print("\nJobs:")
+            for job in jobs:
+                print(f"  #{job.job_id} {job.status}: {job.label}")
+            return
+
+        table = Table(
+            box=box.SIMPLE_HEAVY,
+            expand=True,
+            show_header=True,
+            header_style="accent",
+            border_style="panel",
+        )
+        table.add_column("ID", justify="right", no_wrap=True, width=4)
+        table.add_column("Status", no_wrap=True, width=12)
+        table.add_column("Title", min_width=24)
+        table.add_column("Progress", min_width=24)
+
+        for job in jobs:
+            table.add_row(
+                str(job.job_id),
+                job.status,
+                escape(job.label),
+                escape(self._job_progress_line(job)),
+            )
+
+        self._set_main_renderable(
+            Panel(
+                table,
+                title="[heading]Jobs[/heading]",
+                border_style="panel",
+                padding=(0, 1),
+            )
+        )
+
+    def _prompt_live(self, prompt: str) -> str:
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        new_settings = termios.tcgetattr(fd)
+        new_settings[3] &= ~(termios.ECHO | termios.ICANON)
+        new_settings[6][termios.VMIN] = 0
+        new_settings[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, new_settings)
+
+        try:
+            with self._lock:
+                self._prompt_label = prompt
+                self._prompt_buffer = ""
+            self.refresh()
+            pending_escape = False
+            escape_sequence = ""
+            while True:
+                ready, _, _ = select.select([fd], [], [], 0.1)
+                if not ready:
+                    continue
+
+                chunk = os.read(fd, 32)
+                if not chunk:
+                    continue
+
+                for byte in chunk:
+                    char = chr(byte)
+                    if pending_escape:
+                        escape_sequence += char
+                        if not self._handle_live_escape_sequence(escape_sequence):
+                            pending_escape = False
+                            escape_sequence = ""
+                        continue
+                    if char == "\x1b":
+                        pending_escape = True
+                        escape_sequence = ""
+                        continue
+                    if self._input_mode != "query":
+                        if char == "\x04":
+                            raise EOFError
+                        self._handle_browser_key(char)
+                        continue
+                    if char in ("\r", "\n"):
+                        value = self._prompt_buffer
+                        with self._lock:
+                            self._prompt_label = ""
+                            self._prompt_buffer = ""
+                        self.refresh()
+                        return value
+                    if char in ("\x7f", "\b"):
+                        with self._lock:
+                            self._prompt_buffer = self._prompt_buffer[:-1]
+                        self.refresh()
+                        continue
+                    if char == "\x04":
+                        raise EOFError
+                    if char.isprintable():
+                        with self._lock:
+                            self._prompt_buffer += char
+                        self.refresh()
+        finally:
+            with self._lock:
+                self._prompt_label = ""
+                self._prompt_buffer = ""
+            termios.tcsetattr(fd, termios.TCSANOW, old_settings)
+            self.refresh()
+
+    def _handle_live_escape_sequence(self, sequence: str) -> bool:
+        if sequence in {"[A", "OA"}:
+            self._handle_browser_navigation(-1)
+            return False
+        if sequence in {"[B", "OB"}:
+            self._handle_browser_navigation(1)
+            return False
+        if sequence.startswith("[") and not sequence.endswith(("A", "B", "~")):
+            return True
+        if sequence.startswith("O") and len(sequence) < 2:
+            return True
+        self._handle_browser_escape()
+        return False
+
+    def _handle_browser_navigation(self, delta: int) -> None:
+        if self._input_mode not in {"jobs", "confirm_cancel"}:
+            return
+        jobs = self._browser_jobs()
+        if not jobs:
+            self._exit_job_browser()
+            return
+        ids = [job.job_id for job in jobs]
+        current_id = self._job_browser_selected_id if self._job_browser_selected_id in ids else ids[0]
+        index = ids.index(current_id)
+        index = (index + delta) % len(ids)
+        with self._lock:
+            self._job_browser_selected_id = ids[index]
+            if self._input_mode == "confirm_cancel":
+                self._input_mode = "jobs"
+                self._job_browser_notice = "Press Enter to manage the selected job. Esc/q returns to search."
+        self.refresh()
+
+    def _handle_browser_escape(self) -> None:
+        if self._input_mode == "confirm_cancel":
+            with self._lock:
+                self._input_mode = "jobs"
+                self._job_browser_notice = "Cancel prompt dismissed. Enter opens it again, Esc/q returns to search."
+            self.refresh()
+            return
+        self._exit_job_browser()
+
+    def _handle_browser_key(self, char: str) -> None:
+        if char in {"q", "Q"}:
+            self._exit_job_browser()
+            return
+        if char in {"j", "J"}:
+            self._handle_browser_navigation(1)
+            return
+        if char in {"k", "K"}:
+            self._handle_browser_navigation(-1)
+            return
+        if char in ("\r", "\n"):
+            selected_job = self._selected_browser_job()
+            if selected_job is None:
+                self._exit_job_browser()
+                return
+            if self._input_mode == "confirm_cancel":
+                self._cancel_selected_browser_job(selected_job)
+                return
+            if selected_job.status not in {"queued", "resolving", "downloading"}:
+                with self._lock:
+                    self._job_browser_notice = (
+                        f"Job #{selected_job.job_id} is already {selected_job.status}. Pick an active job or press Esc/q."
+                    )
+                self.refresh()
+                return
+            with self._lock:
+                self._input_mode = "confirm_cancel"
+                self._job_browser_notice = (
+                    f"Cancel job #{selected_job.job_id} '{selected_job.label}'? Press y/n or Enter/Esc/q."
+                )
+            self.refresh()
+            return
+        if self._input_mode == "confirm_cancel":
+            if char in {"y", "Y"}:
+                selected_job = self._selected_browser_job()
+                if selected_job is not None:
+                    self._cancel_selected_browser_job(selected_job)
+                return
+            if char in {"n", "N"}:
+                with self._lock:
+                    self._input_mode = "jobs"
+                    self._job_browser_notice = "Cancel prompt dismissed. Enter opens it again, Esc/q returns to search."
+                self.refresh()
+                return
+
+    def _cancel_selected_browser_job(self, job: DownloadJobSnapshot) -> None:
+        manager = self._download_manager
+        if manager is None:
+            self._exit_job_browser()
+            return
+        cancelled = manager.cancel(job.job_id)
+        with self._lock:
+            self._input_mode = "jobs"
+            if cancelled:
+                self._job_browser_notice = f"Cancel requested for job #{job.job_id}. Esc/q returns to search."
+            else:
+                self._job_browser_notice = f"Could not cancel job #{job.job_id}. It may already be finished."
+        self.refresh()
+
+    def _browser_jobs(self) -> list[DownloadJobSnapshot]:
+        if self._download_manager is None:
+            return []
+        jobs = self._download_manager.snapshot()
+        if not jobs:
+            return []
+        ids = {job.job_id for job in jobs}
+        with self._lock:
+            if self._job_browser_selected_id not in ids:
+                self._job_browser_selected_id = jobs[0].job_id
+        return jobs
+
+    def _selected_browser_job(self) -> DownloadJobSnapshot | None:
+        jobs = self._browser_jobs()
+        if not jobs:
+            return None
+        selected_id = self._job_browser_selected_id
+        for job in jobs:
+            if job.job_id == selected_id:
+                return job
+        return jobs[0]
+
+    def _exit_job_browser(self) -> None:
+        with self._lock:
+            self._input_mode = "query"
+            self._job_browser_notice = ""
+        self.refresh()
+
+    def info(self, message: str) -> None:
+        if self.live_enabled():
+            self._append_event("muted", message)
+        elif self.console:
+            self.console.print(f"[muted]{escape(message)}[/muted]")
+        else:
+            print(message)
+
+    def success(self, message: str) -> None:
+        if self.live_enabled():
+            self._append_event("success", message)
+        elif self.console:
+            self.console.print(f"[success]{escape(message)}[/success]")
+        else:
+            print(message)
+
+    def warning(self, message: str) -> None:
+        if self.live_enabled():
+            self._append_event("warning", message)
+        elif self.console:
+            self.console.print(f"[warning]{escape(message)}[/warning]")
+        else:
+            print(message)
+
+    def error(self, message: str) -> None:
+        if self.live_enabled():
+            self._append_event("error", message)
+        elif self.console:
+            self.console.print(f"[error]{escape(message)}[/error]")
+        else:
+            print(message, file=sys.stderr)
+
+    def status(self, message: str):
+        return UIStatus(self, message)
+
+    def show_help(self) -> None:
+        if not self.rich_enabled():
+            print("Commands: /jobs, /clear-finished, /help, /quit")
+            return
+
+        help_table = Table.grid(expand=True)
+        help_table.add_column(style="accent", ratio=1)
+        help_table.add_column(style="muted", ratio=3)
+        help_table.add_row("/jobs", "Open the live job browser. Use arrows, Enter, and Esc/q.")
+        help_table.add_row("/clear-finished", "Drop completed, failed, and cancelled jobs from this session.")
+        help_table.add_row("/help", "Show command help.")
+        help_table.add_row("/quit", "Cancel remaining jobs and exit cleanly.")
+
+        self._set_main_renderable(
+            Panel(
+                help_table,
+                title="[heading]Commands[/heading]",
+                border_style="panel",
+                padding=(0, 1),
+            )
+        )
+
+    def show_media_candidates(self, candidates: list[MediaCandidate]) -> None:
+        if not self.console:
+            print("\nMatches:")
+            for index, candidate in enumerate(candidates, start=1):
+                media_label = "Movie" if candidate.media_type == "movie" else "Series"
+                print(
+                    f"  {index}. {candidate.title} ({candidate.year}) [{media_label}] [{candidate.imdb_id}]"
+                )
+            return
+
+        table = Table(
+            box=box.SIMPLE_HEAVY,
+            expand=True,
+            show_header=True,
+            header_style="accent",
+            border_style="panel",
+        )
+        table.add_column("#", justify="right", no_wrap=True, width=4)
+        table.add_column("Title", min_width=30)
+        table.add_column("Type", no_wrap=True)
+        table.add_column("IMDb", no_wrap=True)
+
+        for index, candidate in enumerate(candidates, start=1):
+            media_label = "Movie" if candidate.media_type == "movie" else "Series"
+            table.add_row(
+                str(index),
+                f"{escape(candidate.title)} ({escape(candidate.year)})",
+                media_label,
+                escape(candidate.imdb_id),
+            )
+
+        panel = Panel(
+            table,
+            title="[heading]Matches[/heading]",
+            border_style="panel",
+            padding=(0, 1),
+        )
+        if self.live_enabled():
+            self._set_main_renderable(panel)
+            return
+
+        self.console.print()
+        self.console.print(panel)
+
+    def show_stream_candidates(self, candidates: list[StreamCandidate]) -> None:
+        if not self.console:
+            print("\nFiltered results (up to 3 per resolution):")
+            for resolution in ("4K", "1080P"):
+                print(f"\n{resolution}")
+                section = [item for item in candidates if item.resolution == resolution]
+                if not section:
+                    print("  No matching results.")
+                    continue
+                print(f"  Showing {len(section)} match{'es' if len(section) != 1 else ''}.")
+                for item in section:
+                    status = "cached" if item.is_cached else "uncached"
+                    label = (
+                        "strict"
+                        if item.is_strict_match
+                        else f"fallback: {item.fallback_reason}"
+                    )
+                    print(
+                        f"  {item.index}. {item.name} | {format_bytes(item.size_bytes)} | {status} | {label}"
+                    )
+                    if item.description:
+                        print(f"     {item.description.splitlines()[0]}")
+            return
+
+        panels = []
+        for resolution in ("4K", "1080P"):
+            section = [item for item in candidates if item.resolution == resolution]
+            table = Table(
+                box=box.SIMPLE_HEAVY,
+                expand=True,
+                show_header=True,
+                header_style="accent",
+                border_style="panel",
+            )
+            table.add_column("#", justify="right", width=4, no_wrap=True)
+            table.add_column("Release", min_width=32)
+            table.add_column("Size", justify="right", no_wrap=True)
+            table.add_column("Cache", no_wrap=True)
+            table.add_column("Fit", min_width=18)
+
+            if section:
+                for item in section:
+                    status = "cached" if item.is_cached else "uncached"
+                    fit = (
+                        "strict"
+                        if item.is_strict_match
+                        else f"fallback: {item.fallback_reason}"
+                    )
+                    release = escape(item.name)
+                    if item.description:
+                        release += f"\n{escape(item.description.splitlines()[0])}"
+                    table.add_row(
+                        str(item.index),
+                        release,
+                        format_bytes(item.size_bytes),
+                        status,
+                        escape(fit),
+                    )
+                subtitle = (
+                    f"{len(section)} match{'es' if len(section) != 1 else ''}"
+                )
+            else:
+                table.add_row("-", "No matching results.", "-", "-", "-")
+                subtitle = "No candidates"
+
+            panels.append(
+                Panel(
+                    table,
+                    title=f"[heading]{resolution}[/heading]",
+                    subtitle=f"[muted]{subtitle}[/muted]",
+                    border_style="panel",
+                    padding=(0, 1),
+                )
+            )
+
+        group = Group(*panels)
+        if self.live_enabled():
+            self._set_main_renderable(group)
+            return
+
+        self.console.print()
+        self.console.print(group)
+
+    def show_enqueued(self, job: DownloadJobSnapshot) -> None:
+        message = f"Queued job #{job.job_id}: {job.label} -> {job.output_dir}"
+        if self.live_enabled():
+            self.success(message)
+            return
+        self.success(message)
+
+    def show_downloaded(self, destinations: list[Path]) -> None:
+        if len(destinations) == 1:
+            self.success(f"Downloaded: {destinations[0]}")
+            return
+
+        if not self.console:
+            print("Downloaded files:")
+            for destination in destinations:
+                print(f"  {destination}")
+            return
+
+        table = Table(
+            box=box.SIMPLE_HEAVY,
+            expand=True,
+            show_header=True,
+            header_style="accent",
+            border_style="panel",
+        )
+        table.add_column("#", justify="right", width=4, no_wrap=True)
+        table.add_column("Saved File")
+        for index, destination in enumerate(destinations, start=1):
+            table.add_row(str(index), escape(str(destination)))
+
+        panel = Panel(
+            table,
+            title="[success]Downloaded Files[/success]",
+            border_style="panel",
+            padding=(0, 1),
+        )
+        if self.live_enabled():
+            self._set_main_renderable(panel)
+            return
+
+        self.console.print(panel)
+
+    def build_layout(self):
+        layout = Layout()
+        layout.split_row(
+            Layout(self._build_main_column(), name="main"),
+            Layout(self._build_sidebar(), name="sidebar", size=44),
+        )
+        return layout
+
+    def _build_main_column(self):
+        parts = [
+            Panel.fit(
+                "[heading]Comet Search Download[/heading]\n[muted]Search, select, queue, repeat.[/muted]",
+                border_style="panel",
+                padding=(1, 2),
+            )
+        ]
+
+        with self._lock:
+            status_text = self._status_messages[-1] if self._status_messages else ""
+            main_renderable = self._main_renderable
+            prompt_label = self._prompt_label
+            prompt_buffer = self._prompt_buffer
+            event_messages = list(self._event_messages)
+            input_mode = self._input_mode
+            browser_notice = self._job_browser_notice
+
+        if status_text:
+            parts.append(
+                Panel.fit(
+                    f"[accent]{escape(status_text)}[/accent]",
+                    title="[heading]Working[/heading]",
+                    border_style="panel",
+                    padding=(0, 2),
+                )
+            )
+        if input_mode in {"jobs", "confirm_cancel"}:
+            parts.append(self._build_job_browser_panel())
+        elif main_renderable is not None:
+            parts.append(main_renderable)
+
+        events_table = Table.grid(expand=True)
+        events_table.add_column(ratio=1)
+        if event_messages:
+            for level, message in event_messages:
+                events_table.add_row(f"[{level}]{escape(message)}[/{level}]")
+        else:
+            events_table.add_row("[muted]Session events will appear here.[/muted]")
+        parts.append(
+            Panel(
+                events_table,
+                title="[heading]Session[/heading]",
+                border_style="panel",
+                padding=(0, 1),
+            )
+        )
+
+        prompt_text = Text()
+        if input_mode == "jobs":
+            prompt_text.append("Job browser: ", style="accent")
+            prompt_text.append(browser_notice or "Up/Down select, Enter manage, Esc/q return to search.", style="muted")
+        elif input_mode == "confirm_cancel":
+            prompt_text.append("Cancel confirmation: ", style="warning")
+            prompt_text.append(browser_notice or "Press y/n or Enter/Esc/q.", style="muted")
+        else:
+            prompt_text.append(prompt_label or "Search query or command: ", style="accent")
+            prompt_text.append(prompt_buffer, style="heading")
+            if prompt_label:
+                prompt_text.append("█", style="accent_soft")
+            else:
+                prompt_text.append("/help for commands", style="muted")
+        parts.append(
+            Panel(
+                prompt_text,
+                title="[heading]Prompt[/heading]",
+                border_style="panel",
+                padding=(0, 1),
+            )
+        )
+
+        return Group(*parts)
+
+    def _build_sidebar(self):
+        jobs = self._download_manager.snapshot() if self._download_manager else []
+        active = [job for job in jobs if job.status in {"resolving", "downloading"}]
+        queued = [job for job in jobs if job.status == "queued"]
+        finished = [job for job in jobs if job.status in {"completed", "failed", "cancelled"}]
+        finished.sort(key=lambda job: job.finished_at or job.created_at, reverse=True)
+        finished = finished[:6]
+
+        return Group(
+            self._build_job_panel("Active", active, "accent"),
+            self._build_job_panel("Queued", queued, "muted"),
+            self._build_job_panel("Finished This Session", finished, "success"),
+        )
+
+    def _build_job_panel(self, title: str, jobs: list[DownloadJobSnapshot], style: str):
+        table = Table.grid(expand=True)
+        table.add_column(ratio=1)
+        if not jobs:
+            table.add_row("[muted]None[/muted]")
+        else:
+            for job in jobs:
+                lines = [f"[{style}]#{job.job_id}[/{style}] {escape(trim_text(job.label, 28))}"]
+                lines.append(f"[muted]{escape(job.phase)}[/muted]")
+                progress_line = self._job_progress_line(job)
+                if progress_line:
+                    lines.append(f"[accent_soft]{escape(progress_line)}[/accent_soft]")
+                if job.status == "completed" and job.destinations:
+                    lines.append(f"[success]{escape(trim_text(str(job.destinations[-1]), 32))}[/success]")
+                elif job.status == "failed" and job.error_text:
+                    lines.append(f"[error]{escape(trim_text(job.error_text, 32))}[/error]")
+                elif job.status == "cancelled":
+                    lines.append("[warning]Cancelled[/warning]")
+                table.add_row("\n".join(lines))
+
+        return Panel(
+            table,
+            title=f"[heading]{title}[/heading]",
+            border_style="panel",
+            padding=(0, 1),
+        )
+
+    def _build_job_browser_panel(self):
+        jobs = self._browser_jobs()
+        if not jobs:
+            return Panel(
+                "[muted]No downloads in this session yet. Press Esc/q to return to search.[/muted]",
+                title="[heading]Jobs[/heading]",
+                border_style="panel",
+                padding=(1, 2),
+            )
+
+        selected_job = self._selected_browser_job()
+        selected_id = selected_job.job_id if selected_job is not None else None
+        table = Table(
+            box=box.SIMPLE_HEAVY,
+            expand=True,
+            show_header=True,
+            header_style="accent",
+            border_style="panel",
+        )
+        table.add_column("", width=2, no_wrap=True)
+        table.add_column("ID", justify="right", no_wrap=True, width=4)
+        table.add_column("Status", no_wrap=True, width=12)
+        table.add_column("Title", min_width=24)
+        table.add_column("Progress", min_width=24)
+
+        for job in jobs:
+            is_selected = job.job_id == selected_id
+            row_style = "heading" if is_selected else ""
+            marker = ">" if is_selected else ""
+            table.add_row(
+                marker,
+                str(job.job_id),
+                job.status,
+                escape(job.label),
+                escape(self._job_progress_line(job)),
+                style=row_style,
+            )
+
+        instructions = (
+            "[muted]Up/Down select. Enter opens cancel prompt for queued/active jobs. Esc/q returns to search.[/muted]"
+        )
+        if self._input_mode == "confirm_cancel" and selected_job is not None:
+            instructions = (
+                f"[warning]Cancel job #{selected_job.job_id}?[/warning] "
+                "[muted]Press y/n or Enter/Esc/q.[/muted]"
+            )
+
+        return Panel(
+            Group(table, Text.from_markup(instructions)),
+            title="[heading]Jobs[/heading]",
+            border_style="panel",
+            padding=(0, 1),
+        )
+
+    def _job_progress_line(self, job: DownloadJobSnapshot) -> str:
+        details: list[str] = []
+        if job.current_file_index is not None:
+            details.append(f"file {job.current_file_index}/{job.total_files}")
+        elif job.total_files > 1 and job.completed_files:
+            details.append(f"file {job.completed_files}/{job.total_files}")
+        if job.total_bytes:
+            percent = (job.downloaded_bytes / job.total_bytes) * 100 if job.total_bytes else 0.0
+            details.append(f"{percent:5.1f}%")
+            details.append(f"{format_bytes(job.downloaded_bytes)} / {format_bytes(job.total_bytes)}")
+        elif job.downloaded_bytes:
+            details.append(f"{format_bytes(job.downloaded_bytes)} downloaded")
+        if job.speed_bytes_per_second > 0:
+            details.append(format_speed(job.speed_bytes_per_second))
+        if job.eta_seconds is not None:
+            details.append(f"ETA {format_eta(job.eta_seconds)}")
+        return " | ".join(details)
+
+    def print_shutdown_summary(self, jobs: list[DownloadJobSnapshot]) -> None:
+        completed = [job for job in jobs if job.status == "completed"]
+        failed = [job for job in jobs if job.status == "failed"]
+        cancelled = [job for job in jobs if job.status == "cancelled"]
+        self.info(
+            f"Session ended. Completed {len(completed)}, failed {len(failed)}, cancelled {len(cancelled)}."
+        )
+        if completed:
+            self.show_downloaded([path for job in completed for path in job.destinations])
+
+
+class JobReporter:
+    def __init__(self, manager: "DownloadManager", job_id: int) -> None:
+        self._manager = manager
+        self._job_id = job_id
+
+    def ensure_not_cancelled(self) -> None:
+        if self._manager.is_cancel_requested(self._job_id):
+            raise DownloadCancelled()
+
+    def set_resolving(self) -> None:
+        self._manager.update_job(
+            self._job_id,
+            status="resolving",
+            phase="Resolving links",
+            started_at=time.time(),
+            speed_bytes_per_second=0.0,
+            eta_seconds=None,
+        )
+
+    def set_total_files(self, total_files: int) -> None:
+        self._manager.update_job(self._job_id, total_files=total_files)
+
+    def start_file(self, index: int, total_files: int, file_name: str, total_bytes: int | None) -> None:
+        self._manager.update_job(
+            self._job_id,
+            status="downloading",
+            phase=f"Downloading file {index}/{total_files}",
+            current_file_index=index,
+            current_file_name=file_name,
+            total_files=total_files,
+            total_bytes=total_bytes,
+            downloaded_bytes=0,
+            speed_bytes_per_second=0.0,
+            eta_seconds=None,
+        )
+
+    def update_progress(
+        self,
+        *,
+        downloaded_bytes: int,
+        total_bytes: int | None,
+        speed: float,
+        completed_files: int,
+        total_files: int,
+    ) -> None:
+        eta = None
+        if total_bytes is not None and speed > 0:
+            eta = max(total_bytes - downloaded_bytes, 0) / speed
+        self._manager.update_job(
+            self._job_id,
+            status="downloading",
+            phase=f"Downloading file {completed_files + 1}/{total_files}",
+            downloaded_bytes=downloaded_bytes,
+            total_bytes=total_bytes,
+            completed_files=completed_files,
+            total_files=total_files,
+            speed_bytes_per_second=speed,
+            eta_seconds=eta,
+        )
+
+    def finish_file(self, destination: Path, completed_files: int, total_files: int) -> None:
+        self._manager.finish_file(self._job_id, destination, completed_files, total_files)
+
+
+class DownloadManager:
+    def __init__(
+        self,
+        max_parallel: int,
+        event_callback: Callable[[str, str], None] | None = None,
+    ) -> None:
+        self._max_parallel = max_parallel
+        self._event_callback = event_callback
+        self._jobs: dict[int, DownloadJob] = {}
+        self._queued_job_ids: deque[int] = deque()
+        self._lock = threading.RLock()
+        self._condition = threading.Condition(self._lock)
+        self._next_job_id = 1
+        self._accepting = True
+        self._workers = [
+            threading.Thread(target=self._worker_loop, name=f"download-worker-{index}", daemon=True)
+            for index in range(max_parallel)
+        ]
+        for worker in self._workers:
+            worker.start()
+
+    def enqueue(
+        self,
+        *,
+        label: str,
+        host: str,
+        candidate: StreamCandidate,
+        output_dir: Path,
+        fallback_name: str,
+    ) -> DownloadJobSnapshot:
+        with self._condition:
+            if not self._accepting:
+                raise RuntimeError("Downloads are shutting down.")
+            job_id = self._next_job_id
+            self._next_job_id += 1
+            job = DownloadJob(
+                job_id=job_id,
+                label=label,
+                host=host,
+                candidate=candidate,
+                output_dir=output_dir,
+                fallback_name=fallback_name,
+            )
+            self._jobs[job_id] = job
+            self._queued_job_ids.append(job_id)
+            self._condition.notify()
+        self._emit("info", f"Queued job #{job_id}: {label}")
+        return self.snapshot_job(job_id)
+
+    def _worker_loop(self) -> None:
+        while True:
+            with self._condition:
+                while not self._queued_job_ids and self._accepting:
+                    self._condition.wait(timeout=0.2)
+
+                if not self._queued_job_ids and not self._accepting:
+                    return
+
+                job_id = self._queued_job_ids.popleft()
+                job = self._jobs.get(job_id)
+                if job is None:
+                    continue
+                if job.cancel_requested:
+                    job.status = "cancelled"
+                    job.phase = "Cancelled before start"
+                    job.finished_at = time.time()
+                    continue
+
+            reporter = JobReporter(self, job_id)
+            try:
+                reporter.set_resolving()
+                destinations = download_selected_stream(
+                    job.host,
+                    job.candidate,
+                    job.output_dir,
+                    job.fallback_name,
+                    reporter=reporter,
+                    cancel_event=job.cancel_event,
+                )
+            except DownloadCancelled:
+                self._mark_cancelled(job_id, "Cancelled")
+            except Exception as error:
+                self._mark_failed(job_id, str(error))
+            else:
+                self._mark_completed(job_id, destinations)
+
+    def update_job(self, job_id: int, **changes: Any) -> None:
+        with self._lock:
+            job = self._jobs[job_id]
+            for key, value in changes.items():
+                setattr(job, key, value)
+
+    def finish_file(self, job_id: int, destination: Path, completed_files: int, total_files: int) -> None:
+        with self._lock:
+            job = self._jobs[job_id]
+            job.destinations.append(destination)
+            job.completed_files = completed_files
+            job.total_files = total_files
+            job.current_file_name = ""
+            job.current_file_index = None
+            job.downloaded_bytes = 0
+            job.total_bytes = None
+            job.speed_bytes_per_second = 0.0
+            job.eta_seconds = None
+
+    def is_cancel_requested(self, job_id: int) -> bool:
+        with self._lock:
+            job = self._jobs[job_id]
+            return job.cancel_requested or job.cancel_event.is_set()
+
+    def cancel(self, job_id: int) -> bool:
+        with self._condition:
+            job = self._jobs.get(job_id)
+            if job is None or job.status in {"completed", "failed", "cancelled"}:
+                return False
+            job.cancel_requested = True
+            job.cancel_event.set()
+            if job.status == "queued":
+                try:
+                    self._queued_job_ids.remove(job_id)
+                except ValueError:
+                    pass
+                job.status = "cancelled"
+                job.phase = "Cancelled"
+                job.finished_at = time.time()
+                self._emit("warning", f"Cancelled queued job #{job_id}: {job.label}")
+            else:
+                self._emit("warning", f"Cancelling active job #{job_id}: {job.label}")
+            self._condition.notify_all()
+        return True
+
+    def clear_finished(self) -> int:
+        with self._condition:
+            finished_ids = [
+                job_id
+                for job_id, job in self._jobs.items()
+                if job.status in {"completed", "failed", "cancelled"}
+            ]
+            for job_id in finished_ids:
+                self._jobs.pop(job_id, None)
+            return len(finished_ids)
+
+    def shutdown(self) -> list[DownloadJobSnapshot]:
+        with self._condition:
+            self._accepting = False
+            for job_id in list(self._queued_job_ids):
+                job = self._jobs.get(job_id)
+                if job is None:
+                    continue
+                job.cancel_requested = True
+                job.status = "cancelled"
+                job.phase = "Cancelled during shutdown"
+                job.finished_at = time.time()
+                self._emit("warning", f"Cancelled queued job #{job_id}: {job.label}")
+            self._queued_job_ids.clear()
+
+            for job in self._jobs.values():
+                if job.status in {"resolving", "downloading"}:
+                    job.cancel_requested = True
+                    job.cancel_event.set()
+
+            self._condition.notify_all()
+
+        for worker in self._workers:
+            worker.join()
+
+        return self.snapshot()
+
+    def snapshot(self) -> list[DownloadJobSnapshot]:
+        with self._lock:
+            jobs = [self._make_snapshot(job) for job in self._jobs.values()]
+        jobs.sort(key=lambda job: job.created_at)
+        return jobs
+
+    def snapshot_job(self, job_id: int) -> DownloadJobSnapshot:
+        with self._lock:
+            job = self._jobs[job_id]
+            return self._make_snapshot(job)
+
+    def _make_snapshot(self, job: DownloadJob) -> DownloadJobSnapshot:
+        return DownloadJobSnapshot(
+            job_id=job.job_id,
+            label=job.label,
+            status=job.status,
+            phase=job.phase,
+            created_at=job.created_at,
+            started_at=job.started_at,
+            finished_at=job.finished_at,
+            total_files=job.total_files,
+            completed_files=job.completed_files,
+            current_file_index=job.current_file_index,
+            current_file_name=job.current_file_name,
+            total_bytes=job.total_bytes,
+            downloaded_bytes=job.downloaded_bytes,
+            speed_bytes_per_second=job.speed_bytes_per_second,
+            eta_seconds=job.eta_seconds,
+            destinations=tuple(job.destinations),
+            error_text=job.error_text,
+            cancel_requested=job.cancel_requested,
+            output_dir=job.output_dir,
+        )
+
+    def _mark_completed(self, job_id: int, destinations: list[Path]) -> None:
+        with self._lock:
+            job = self._jobs[job_id]
+            if not job.destinations:
+                job.destinations.extend(destinations)
+            job.status = "completed"
+            job.phase = "Completed"
+            job.finished_at = time.time()
+            job.current_file_index = None
+            job.current_file_name = ""
+            job.speed_bytes_per_second = 0.0
+            job.eta_seconds = None
+            job.downloaded_bytes = 0
+            job.total_bytes = None
+            outputs = [str(path) for path in job.destinations]
+            label = job.label
+        self._emit("success", f"Completed job #{job_id}: {label}")
+        if outputs:
+            self._emit("success", "Saved: " + ", ".join(outputs[:2]))
+
+    def _mark_failed(self, job_id: int, error_text: str) -> None:
+        with self._lock:
+            job = self._jobs[job_id]
+            job.status = "failed"
+            job.phase = "Failed"
+            job.finished_at = time.time()
+            job.error_text = error_text
+            job.speed_bytes_per_second = 0.0
+            job.eta_seconds = None
+            label = job.label
+        self._emit("error", f"Job #{job_id} failed: {label} ({error_text})")
+
+    def _mark_cancelled(self, job_id: int, phase: str) -> None:
+        with self._lock:
+            job = self._jobs[job_id]
+            job.status = "cancelled"
+            job.phase = phase
+            job.finished_at = time.time()
+            job.speed_bytes_per_second = 0.0
+            job.eta_seconds = None
+            label = job.label
+        self._emit("warning", f"Job #{job_id} cancelled: {label}")
+
+    def _emit(self, level: str, message: str) -> None:
+        if self._event_callback is not None:
+            self._event_callback(level, message)
+
+
+def trim_text(value: str, max_length: int) -> str:
+    if len(value) <= max_length:
+        return value
+    return value[: max_length - 3] + "..."
+
+
+UI = TerminalUI()
+
+
 def default_download_dir() -> Path:
     if os.name == "nt":
         user_profile = os.environ.get("USERPROFILE", "").strip()
@@ -126,7 +1462,16 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Restart the local Comet process before searching.",
     )
-    return parser.parse_args()
+    parser.add_argument(
+        "--parallel-downloads",
+        type=int,
+        default=2,
+        help="Maximum number of downloads to run at once.",
+    )
+    args = parser.parse_args()
+    if args.parallel_downloads < 1:
+        parser.error("--parallel-downloads must be at least 1.")
+    return args
 
 
 def parse_env_file(path: Path) -> tuple[list[str], dict[str, str]]:
@@ -199,7 +1544,7 @@ def load_token(cli_token: str | None) -> tuple[str, bool]:
     if token:
         return token, False
 
-    token = input("Real-Debrid API token: ").strip()
+    token = UI.prompt("Real-Debrid API token: ").strip()
     if not token:
         raise SystemExit("A Real-Debrid API token is required.")
     return token, upsert_env_value(ENV_PATH, REALDEBRID_ENV_KEY, token)
@@ -371,7 +1716,8 @@ def stop_existing_comet_processes(host: str) -> bool:
 
 def ensure_comet_running(host: str, restart: bool = False) -> None:
     if restart and check_health(host):
-        stop_existing_comet_processes(host)
+        with UI.status("Restarting local Comet backend"):
+            stop_existing_comet_processes(host)
 
     if check_health(host):
         return
@@ -388,10 +1734,11 @@ def ensure_comet_running(host: str, restart: bool = False) -> None:
         )
 
     deadline = time.time() + HEALTHCHECK_TIMEOUT
-    while time.time() < deadline:
-        if check_health(host):
-            return
-        time.sleep(1)
+    with UI.status(f"Starting local Comet backend via {launch.description}"):
+        while time.time() < deadline:
+            if check_health(host):
+                return
+            time.sleep(1)
 
     raise RuntimeError(
         f"Comet did not become healthy within {HEALTHCHECK_TIMEOUT}s using {launch.description}. "
@@ -502,37 +1849,32 @@ def search_tmdb(query: str) -> list[MediaCandidate]:
 
 def prompt_choice(prompt: str, max_value: int) -> int:
     while True:
-        raw = input(prompt).strip()
+        raw = UI.prompt(prompt).strip()
         if raw.isdigit() and 1 <= int(raw) <= max_value:
             return int(raw)
-        print(f"Enter a number between 1 and {max_value}.")
+        UI.warning(f"Enter a number between 1 and {max_value}.")
 
 
 def choose_media(candidates: list[MediaCandidate]) -> MediaCandidate:
     if not candidates:
         raise SystemExit("No movie or show candidates were found for that query.")
 
-    print("\nMatches:")
-    for index, candidate in enumerate(candidates, start=1):
-        media_label = "Movie" if candidate.media_type == "movie" else "Series"
-        print(
-            f"  {index}. {candidate.title} ({candidate.year}) [{media_label}] [{candidate.imdb_id}]"
-        )
+    UI.show_media_candidates(candidates)
     return candidates[prompt_choice("Choose a title: ", len(candidates)) - 1]
 
 
 def prompt_series_scope() -> tuple[int, int | None]:
     while True:
-        season = input("Season number: ").strip()
-        episode = input("Episode number (leave blank for full season): ").strip()
+        season = UI.prompt("Season number: ").strip()
+        episode = UI.prompt("Episode number (leave blank for full season): ").strip()
         if not season.isdigit() or int(season) <= 0:
-            print("Season number must be a positive integer.")
+            UI.warning("Season number must be a positive integer.")
             continue
         if not episode:
             return int(season), None
         if episode.isdigit() and int(episode) > 0:
             return int(season), int(episode)
-        print("Episode number must be blank or a positive integer.")
+        UI.warning("Episode number must be blank or a positive integer.")
 
 
 def normalize_resolution(name: str) -> str | None:
@@ -648,22 +1990,7 @@ def print_streams(candidates: list[StreamCandidate]) -> None:
             "No streams matched the current filters for 4K/1080P, size, and English language."
         )
 
-    print("\nFiltered results (up to 3 per resolution):")
-    for resolution in ("4K", "1080P"):
-        print(f"\n{resolution}")
-        section = [item for item in candidates if item.resolution == resolution]
-        if not section:
-            print("  No matching results.")
-            continue
-        print(f"  Showing {len(section)} match{'es' if len(section) != 1 else ''}.")
-        for item in section:
-            status = "cached" if item.is_cached else "uncached"
-            label = "strict" if item.is_strict_match else f"fallback: {item.fallback_reason}"
-            print(
-                f"  {item.index}. {item.name} | {format_bytes(item.size_bytes)} | {status} | {label}"
-            )
-            if item.description:
-                print(f"     {item.description.splitlines()[0]}")
+    UI.show_stream_candidates(candidates)
 
 
 def fetch_streams(host: str, b64config: str, media_type: str, media_id: str) -> list[dict[str, Any]]:
@@ -753,8 +2080,13 @@ def extract_filename(headers, fallback_name: str, fallback_ext: str = ".mkv") ->
     return cleaned
 
 
-def download_from_url(download_url: str, output_dir: Path, fallback_name: str) -> Path:
-    return download_from_url_with_progress(download_url, output_dir, fallback_name)
+def reserve_destination_path(output_dir: Path, filename: str) -> tuple[Path, Path]:
+    destination = output_dir / filename
+    suffix = 1
+    while destination.exists() or destination.with_name(f"{destination.name}.part").exists():
+        destination = destination.with_name(f"{destination.stem} ({suffix}){destination.suffix}")
+        suffix += 1
+    return destination, destination.with_name(f"{destination.name}.part")
 
 
 def download_from_url_with_progress(
@@ -762,66 +2094,53 @@ def download_from_url_with_progress(
     output_dir: Path,
     fallback_name: str,
     *,
+    reporter: JobReporter | None = None,
+    cancel_event: threading.Event | None = None,
     completed_files: int = 0,
     total_files: int = 1,
 ) -> Path:
     output_dir.mkdir(parents=True, exist_ok=True)
+    if cancel_event is not None and cancel_event.is_set():
+        raise DownloadCancelled()
 
     with urlopen(download_url, timeout=300) as download_response:
         filename = extract_filename(download_response.headers, fallback_name)
-        destination = output_dir / filename
-        suffix = 1
-        while destination.exists():
-            destination = destination.with_name(
-                f"{destination.stem} ({suffix}){destination.suffix}"
-            )
-            suffix += 1
-
+        destination, temp_destination = reserve_destination_path(output_dir, filename)
         total_bytes = download_response.headers.get("Content-Length")
         total_bytes_int = int(total_bytes) if total_bytes and total_bytes.isdigit() else None
         downloaded_bytes = 0
         started_at = time.time()
+        if reporter is not None:
+            reporter.start_file(completed_files + 1, total_files, filename, total_bytes_int)
 
-        with destination.open("wb") as file_handle:
-            while True:
-                chunk = download_response.read(1024 * 1024)
-                if not chunk:
-                    break
-                file_handle.write(chunk)
-                downloaded_bytes += len(chunk)
+        try:
+            with temp_destination.open("wb") as file_handle:
+                while True:
+                    if cancel_event is not None and cancel_event.is_set():
+                        raise DownloadCancelled()
+                    if reporter is not None:
+                        reporter.ensure_not_cancelled()
 
-                elapsed = max(time.time() - started_at, 1e-6)
-                speed = downloaded_bytes / elapsed
-                if total_bytes_int:
-                    if total_files > 1:
-                        estimated_total_bytes = total_bytes_int * total_files
-                        aggregate_downloaded_bytes = (
-                            completed_files * total_bytes_int + downloaded_bytes
-                        )
-                        percent = (aggregate_downloaded_bytes / estimated_total_bytes) * 100
-                        remaining = max(estimated_total_bytes - aggregate_downloaded_bytes, 0)
-                        progress = (
-                            f"\rProgress: {percent:6.2f}% | "
-                            f"{format_bytes(aggregate_downloaded_bytes)} / "
-                            f"{format_bytes(estimated_total_bytes)} estimated | "
-                        )
-                    else:
-                        percent = (downloaded_bytes / total_bytes_int) * 100
-                        remaining = max(total_bytes_int - downloaded_bytes, 0)
-                        progress = (
-                            f"\rProgress: {percent:6.2f}% | "
-                            f"{format_bytes(downloaded_bytes)} / {format_bytes(total_bytes_int)} | "
-                        )
-                    eta = remaining / speed if speed > 0 else None
-                    progress += f"{format_speed(speed)} | ETA {format_eta(eta)}"
-                else:
-                    progress = (
-                        f"\rProgress: {format_bytes(downloaded_bytes)} downloaded | "
-                        f"{format_speed(speed)} | ETA {format_eta(None)}"
-                    )
-                print(progress, end="", flush=True)
+                    chunk = download_response.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    file_handle.write(chunk)
+                    downloaded_bytes += len(chunk)
 
-        print()
+                    elapsed = max(time.time() - started_at, 1e-6)
+                    speed = downloaded_bytes / elapsed
+                    if reporter is not None:
+                        reporter.update_progress(
+                            downloaded_bytes=downloaded_bytes,
+                            total_bytes=total_bytes_int,
+                            speed=speed,
+                            completed_files=completed_files,
+                            total_files=total_files,
+                        )
+            os.replace(temp_destination, destination)
+        except Exception:
+            temp_destination.unlink(missing_ok=True)
+            raise
 
     return destination
 
@@ -839,125 +2158,245 @@ def download_selected_stream(
     candidate: StreamCandidate,
     output_dir: Path,
     fallback_name: str,
+    *,
+    reporter: JobReporter | None = None,
+    cancel_event: threading.Event | None = None,
 ) -> list[Path]:
     playback_url = urljoin(f"{host.rstrip('/')}/", candidate.playback_url.lstrip("/"))
     request = Request(playback_url)
 
     opener = urllib.request.build_opener(NoRedirectHandler(), NoRedirectProcessor())
+    if reporter is not None:
+        reporter.ensure_not_cancelled()
+        reporter.set_resolving()
+    if cancel_event is not None and cancel_event.is_set():
+        raise DownloadCancelled()
     try:
         response = opener.open(request, timeout=30)
     except HTTPError as error:
         response = error
 
-    if response.code in (301, 302, 303, 307, 308):
-        location = response.headers.get("Location", "").strip()
+    response_code = response.code
+    headers = response.headers
+    body_bytes = response.read() if response_code == 200 else None
+
+    if response_code in (301, 302, 303, 307, 308):
+        location = headers.get("Location", "").strip()
         if not location:
             raise RuntimeError("Playback redirect did not include a download URL.")
         download_url = urljoin(playback_url, location)
-        return [download_from_url(download_url, output_dir, fallback_name)]
+        if reporter is not None:
+            reporter.set_total_files(1)
+        destination = download_from_url_with_progress(
+            download_url,
+            output_dir,
+            fallback_name,
+            reporter=reporter,
+            cancel_event=cancel_event,
+        )
+        if reporter is not None:
+            reporter.finish_file(destination, 1, 1)
+        return [destination]
 
-    content_type = response.headers.get("Content-Type", "")
-    if response.code == 200 and "application/json" in content_type:
-        payload = json.loads(response.read().decode("utf-8"))
+    content_type = headers.get("Content-Type", "")
+    if response_code == 200 and "application/json" in content_type:
+        payload = json.loads((body_bytes or b"").decode("utf-8"))
         downloads = payload.get("downloads")
         if not isinstance(downloads, list) or not downloads:
             raise RuntimeError("Playback JSON response did not include downloadable files.")
 
-        destinations: list[Path] = []
-        for index, item in enumerate(downloads, start=1):
+        valid_downloads: list[tuple[str, str]] = []
+        for item in downloads:
             if not isinstance(item, dict):
                 continue
             download_url = str(item.get("url", "")).strip()
             if not download_url:
                 continue
             per_file_name = build_file_fallback_name(str(item.get("name", "")), fallback_name)
-            print(f"\nDownloading file {index}/{len(downloads)} ...")
-            destinations.append(
-                download_from_url_with_progress(
-                    download_url,
-                    output_dir,
-                    per_file_name,
-                    completed_files=index - 1,
-                    total_files=len(downloads),
-                )
+            valid_downloads.append((download_url, per_file_name))
+
+        if not valid_downloads:
+            raise RuntimeError("Playback JSON response did not contain valid downloadable URLs.")
+
+        if reporter is not None:
+            reporter.set_total_files(len(valid_downloads))
+        destinations: list[Path] = []
+        for index, (download_url, per_file_name) in enumerate(valid_downloads, start=1):
+            if cancel_event is not None and cancel_event.is_set():
+                raise DownloadCancelled()
+            if reporter is not None:
+                reporter.ensure_not_cancelled()
+            destination = download_from_url_with_progress(
+                download_url,
+                output_dir,
+                per_file_name,
+                reporter=reporter,
+                cancel_event=cancel_event,
+                completed_files=index - 1,
+                total_files=len(valid_downloads),
             )
+            destinations.append(destination)
+            if reporter is not None:
+                reporter.finish_file(destination, index, len(valid_downloads))
+        return destinations
 
-        if destinations:
-            return destinations
-        raise RuntimeError("Playback JSON response did not contain valid downloadable URLs.")
-
-    body = response.read().decode("utf-8", errors="replace")
+    body = (body_bytes or response.read()).decode("utf-8", errors="replace")
     raise RuntimeError(
-        f"Playback did not return a download URL or file list (HTTP {response.code}): {body[:200]}"
+        f"Playback did not return a download URL or file list (HTTP {response_code}): {body[:200]}"
     )
+
+
+def emit_ui_event(level: str, message: str) -> None:
+    if level == "success":
+        UI.success(message)
+    elif level == "warning":
+        UI.warning(message)
+    elif level == "error":
+        UI.error(message)
+    else:
+        UI.info(message)
+
+
+def queue_download_for_query(
+    *,
+    host: str,
+    token: str,
+    base_output_dir: Path,
+    manager: DownloadManager,
+    query: str,
+) -> None:
+    with UI.status(f"Searching TMDB for {query}"):
+        candidates = search_tmdb(query)
+    chosen_media = choose_media(candidates)
+    media_id = chosen_media.imdb_id
+    season = None
+    episode = None
+
+    if chosen_media.media_type == "series":
+        season, episode = prompt_series_scope()
+        media_id = (
+            f"{media_id}:{season}"
+            if episode is None
+            else f"{media_id}:{season}:{episode}"
+        )
+
+    b64config = build_b64_config(token)
+    with UI.status("Fetching stream candidates"):
+        raw_streams = fetch_streams(host, b64config, chosen_media.media_type, media_id)
+        size_context = SizePreferenceContext(
+            media_type=chosen_media.media_type,
+            season=season,
+            episode=episode,
+        )
+        grouped_streams = group_top_streams(
+            build_stream_candidates(raw_streams, size_context)
+        )
+    print_streams(grouped_streams)
+    selected_stream = choose_stream(grouped_streams)
+    preferred_name = build_preferred_filename_base(
+        chosen_media,
+        selected_stream.resolution,
+        season=season,
+        episode=episode,
+    )
+    target_dir = base_output_dir / build_collection_dir_name(chosen_media, season=season)
+    job = manager.enqueue(
+        label=preferred_name,
+        host=host,
+        candidate=selected_stream,
+        output_dir=target_dir,
+        fallback_name=preferred_name,
+    )
+    UI.show_enqueued(job)
+
+
+def handle_command(raw_command: str, manager: DownloadManager) -> bool:
+    parts = raw_command.split()
+    command = parts[0].lower()
+
+    if command == "/jobs":
+        UI.show_jobs(manager.snapshot())
+        return False
+
+    if command == "/cancel":
+        if len(parts) != 2 or not parts[1].isdigit():
+            UI.warning("Usage: /cancel <job_id>")
+            return False
+        job_id = int(parts[1])
+        if manager.cancel(job_id):
+            UI.warning(f"Cancel requested for job #{job_id}.")
+        else:
+            UI.warning(f"Could not cancel job #{job_id}.")
+        return False
+
+    if command == "/clear-finished":
+        cleared = manager.clear_finished()
+        UI.info(f"Cleared {cleared} finished job{'s' if cleared != 1 else ''}.")
+        return False
+
+    if command == "/help":
+        UI.show_help()
+        return False
+
+    if command == "/quit":
+        return True
+
+    UI.warning("Unknown command. Use /help to list available commands.")
+    return False
 
 
 def main() -> None:
     args = parse_args()
     token, token_saved = load_token(args.token)
     base_output_dir, output_saved = resolve_output_dir(args.output_dir)
+    manager = DownloadManager(args.parallel_downloads, event_callback=emit_ui_event)
+    UI.bind_download_manager(manager)
 
-    should_restart = args.restart_comet
-    ensure_comet_running(args.host, restart=should_restart)
-    if token_saved:
-        print(f"Saved {REALDEBRID_ENV_KEY} to {ENV_PATH}.")
-    if output_saved:
-        print(f"Saved {DOWNLOAD_DIR_ENV_KEY} to {ENV_PATH}.")
+    UI.start_session()
+    shutdown_jobs: list[DownloadJobSnapshot] = []
+    try:
+        should_restart = args.restart_comet
+        ensure_comet_running(args.host, restart=should_restart)
+        if token_saved:
+            UI.success(f"Saved {REALDEBRID_ENV_KEY} to {ENV_PATH}.")
+        if output_saved:
+            UI.success(f"Saved {DOWNLOAD_DIR_ENV_KEY} to {ENV_PATH}.")
 
-    query_override = args.query
-    while True:
-        print()
-        query = (query_override or input("Search query: ")).strip()
-        query_override = None
-        if not query:
-            print("A search query is required.")
-            continue
+        UI.show_header()
+        UI.info(
+            f"Download queue ready. Running up to {args.parallel_downloads} download"
+            f"{'s' if args.parallel_downloads != 1 else ''} at once."
+        )
 
-        candidates = search_tmdb(query)
-        chosen_media = choose_media(candidates)
-        media_id = chosen_media.imdb_id
-        season = None
-        episode = None
+        query_override = args.query
+        while True:
+            UI.blank()
+            try:
+                raw_value = (query_override or UI.prompt("Search query or command: ")).strip()
+            except EOFError:
+                raw_value = "/quit"
+            query_override = None
+            if not raw_value:
+                UI.warning("A search query or command is required.")
+                continue
 
-        if chosen_media.media_type == "series":
-            season, episode = prompt_series_scope()
-            media_id = (
-                f"{media_id}:{season}"
-                if episode is None
-                else f"{media_id}:{season}:{episode}"
+            if raw_value.startswith("/"):
+                if handle_command(raw_value, manager):
+                    break
+                continue
+
+            queue_download_for_query(
+                host=args.host,
+                token=token,
+                base_output_dir=base_output_dir,
+                manager=manager,
+                query=raw_value,
             )
-
-        b64config = build_b64_config(token)
-        raw_streams = fetch_streams(args.host, b64config, chosen_media.media_type, media_id)
-        size_context = SizePreferenceContext(
-            media_type=chosen_media.media_type,
-            season=season,
-            episode=episode,
-        )
-        grouped_streams = group_top_streams(build_stream_candidates(raw_streams, size_context))
-        print_streams(grouped_streams)
-        selected_stream = choose_stream(grouped_streams)
-        preferred_name = build_preferred_filename_base(
-            chosen_media,
-            selected_stream.resolution,
-            season=season,
-            episode=episode,
-        )
-        target_dir = base_output_dir / build_collection_dir_name(chosen_media, season=season)
-
-        print(f"\nDownloading to {target_dir} ...")
-        destinations = download_selected_stream(
-            args.host,
-            selected_stream,
-            target_dir,
-            preferred_name,
-        )
-        if len(destinations) == 1:
-            print(f"Downloaded: {destinations[0]}")
-        else:
-            print("Downloaded files:")
-            for destination in destinations:
-                print(f"  {destination}")
+    finally:
+        shutdown_jobs = manager.shutdown()
+        UI.stop_session()
+        if shutdown_jobs:
+            UI.print_shutdown_summary(shutdown_jobs)
 
 
 if __name__ == "__main__":
