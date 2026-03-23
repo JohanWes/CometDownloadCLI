@@ -1,78 +1,129 @@
-<h1 align="center" id="title">☄️ Comet</h1>
+# Comet Search Download
 
-<p align="center">
-  <a href="https://discord.com/invite/UJEqpT42nb"><img src="https://img.shields.io/badge/Discord-Join%20Us-5865F2?style=flat-square&logo=discord&logoColor=white" /></a>
-  <a href="https://stremio-addons.net/addons/comet"><img src="https://img.shields.io/badge/Stremio-Addon-7B3FE4?style=flat-square&logo=stremio&logoColor=white" /></a>
-  <a href="kodi/README.md"><img src="https://img.shields.io/badge/Kodi-Addon-17B2E7?style=flat-square&logo=kodi&logoColor=white" /></a>
-</p>
+This repository is now a single-purpose local downloader built around [`scripts/comet_search_download.py`](/home/johanw/repos/comet/scripts/comet_search_download.py).
 
-<p align="center"><img src="https://socialify.git.ci/g0ldyy/comet/image?description=1&font=Inter&forks=1&language=1&name=1&owner=1&pattern=Solid&stargazers=1&theme=Dark" /></p>
+The script:
 
-# Features
-- **CometNet**: Decentralized P2P network for automatic torrent metadata sharing ([documentation](docs/cometnet/README.md))
-- **Kodi Support**: Dedicated official add-on with automatic updates ([documentation](kodi/README.md))
-- Proxy Debrid Streams to allow simultaneous use on multiple IPs!
-- IP-Based Max Connection Limit
-- Administration Dashboard with Bandwidth Manager, Metrics and more...
-- Supported Scrapers: Jackett, Prowlarr, Torrentio, Zilean, MediaFusion, Debridio, StremThru, AIOStreams, Comet, Jackettio, TorBox, Nyaa, BitMagnet, TorrentsDB, Peerflix, DMM and SeaDex
-- Caching system ft. SQLite / PostgreSQL
-- Blazing Fast Background Scraper
-- Debrid Account Scraper: Scrape torrents directly from your debrid account library
-- [DMM](https://github.com/debridmediamanager/hashlists) Ingester: Automatically download and index Debrid Media Manager hashlists
-- Smart Torrent Ranking powered by [TPR](https://github.com/g0ldyy/torrent-parse-rank)
-- Proxy support to bypass debrid restrictions
-- Real-Debrid, All-Debrid, Premiumize, TorBox, Debrid-Link, Debrider, EasyDebrid, OffCloud and PikPak supported
-- Direct Torrent supported
-- [Kitsu](https://kitsu.io/) support (anime)
-- Adult Content Filter
-- ChillLink Protocol support
+- stores and reuses your `REALDEBRID_API_TOKEN` in `.env`
+- starts the local backend automatically when needed
+- searches movies and TV shows by title
+- lets you choose a movie, an episode, or a season search
+- shows top 4K and 1080p results, preferring movies and episodes at 4K 3-10 GB and 1080p 1-5 GB, with wider bands for full seasons
+- downloads the selected result to the OS Downloads folder by default:
+  Linux uses `~/Downloads`, Windows uses `%USERPROFILE%\Downloads`
+- creates a per-title folder such as `~/Downloads/<Title> (<Year>)/` for movies and `~/Downloads/<Title> Season 01 (<Year>)/` for series downloads
+- ignores old temp-directory defaults such as `/tmp/...` and falls back to the OS Downloads folder instead
+- downloads every matching episode file for full-season selections
+- shows progress percent, speed, and ETA
+- loops back to a new search after each completed download
+- falls back to human-friendly filenames such as `Inception (2010) 2160p.mkv`
 
-# Installation
-To customize your Comet experience to suit your needs, please first take a look at all the [environment variables](https://github.com/g0ldyy/comet/blob/main/.env-sample)!
+## Requirements
 
-## Self Hosted
-### From source (developers)
-- Clone the repository and enter the folder
-    ```sh
-    git clone https://github.com/g0ldyy/comet
-    cd comet
-    ```
-- Install dependencies
-    ```sh
-    pip install uv
-    uv sync
-    ````
-- Start Comet
-    ```sh
-    uv run python -m comet.main
-    ````
+- Linux or macOS shell environment
+- Python 3.13+
+- A Real-Debrid account and API token
+- Network access to:
+  - TMDB, for title search in the CLI script
+  - `stremthru.13377001.xyz`, for torrent search/cache/link generation
 
-### Docker / production-style setup
+## Setup
 
-Use the dedicated documentation:
+Create a virtual environment and install the project:
 
-- Beginner step-by-step: [docs/beginner/01-get-started-docker.md](docs/beginner/01-get-started-docker.md)
-- Full documentation index: [docs/README.md](docs/README.md)
+```bash
+python -m venv .venv
+./.venv/bin/pip install -e .
+```
 
-# CometNet (P2P Network)
-Comet transforms your Comet instance from an isolated scraper into a participant in a collaborative network. Instead of each instance independently discovering the same torrents, CometNet allows instances to share their discovered **metadata** (hashes, titles, etc.) with each other in a decentralized way. **No actual files are shared.**
+Create `.env` from [`.env-sample`](/home/johanw/repos/comet/.env-sample) and set at least:
 
-Key benefits:
-- **Improved Coverage**: Receive torrent metadata discovered by other nodes.
-- **Reduced Load**: Less redundant scraping across the network.
-- **Trust Pools**: Optional closed groups for trusted metadata sharing.
+```dotenv
+REALDEBRID_API_TOKEN=your_token_here
+```
 
-For more information on how to setup and configure CometNet, please refer to the [CometNet Documentation](docs/cometnet/README.md).
+Optional `.env` values:
 
-## Support the Project
-Comet is a community-driven project, and your support helps it grow! 🚀
+- `COMET_DOWNLOAD_DIR=/path/to/downloads`
+- `PUBLIC_API_TOKEN=your_prefix_token`
+- `FASTAPI_HOST=127.0.0.1`
+- `FASTAPI_PORT=8000`
+- `STREMTHRU_URL=https://stremthru.13377001.xyz`
 
-- ❤️ **Donate** via [GitHub Sponsors](https://github.com/sponsors/g0ldyy) or [Ko-fi](https://ko-fi.com/g0ldyy) to support development
-- ⭐ **Star the repository** here on GitHub
-- ⭐ **Star the add-on** on [stremio-addons.net](https://stremio-addons.net/addons/comet)
-- 🐛 **Contribute** by reporting issues, suggesting features, or submitting PRs
+## Run
 
-## Web UI Showcase
-<img src="https://i.imgur.com/7xY5AEi.png" />
-<img src="https://i.imgur.com/Dzs4wax.png" />
-<img src="https://i.imgur.com/L3RkfO8.jpeg" />
+Run the downloader directly:
+
+```bash
+./.venv/bin/python scripts/comet_search_download.py
+```
+
+Useful options:
+
+```bash
+./.venv/bin/python scripts/comet_search_download.py --query "Inception"
+./.venv/bin/python scripts/comet_search_download.py --restart-comet
+./.venv/bin/python scripts/comet_search_download.py --output-dir ~/Downloads
+```
+
+The script starts the local backend by launching:
+
+```bash
+python -m comet.main
+```
+
+You can also start the backend manually:
+
+```bash
+./.venv/bin/python -m comet.main
+```
+
+## How `.env` Is Used
+
+- `REALDEBRID_API_TOKEN` is read by the script and saved automatically the first time you enter it.
+- `COMET_DOWNLOAD_DIR` is reused as the default destination if set.
+- `--output-dir` only applies to the current run and does not update `.env`.
+- `PUBLIC_API_TOKEN` adds an optional `/s/<token>` API prefix. The script uses it automatically if present.
+- Backend host and port come from `FASTAPI_HOST` and `FASTAPI_PORT`.
+
+## How Downloads Work
+
+1. The CLI searches TMDB by title and lets you pick a movie or show.
+2. The local backend searches StremThru’s Torznab feed by IMDb ID.
+3. Results are filtered to 4K and 1080p, with preferred size bands of 3-10 GB for 4K and 1-5 GB for 1080p for movies and episodes, and doubled bands for full-season searches, then cache-checked against your Real-Debrid account.
+4. When you choose a result, the backend adds the magnet through StremThru and generates Real-Debrid download links for the matching file or files.
+5. The CLI downloads the file locally and shows progress percent, speed, and ETA.
+6. If the upstream filename is generic, the CLI falls back to a readable local name.
+
+## Restart Or Reset
+
+Restart the backend from the script:
+
+```bash
+./.venv/bin/python scripts/comet_search_download.py --restart-comet
+```
+
+Stop it manually:
+
+```bash
+pkill -f "comet.main"
+```
+
+Reset local runtime artifacts:
+
+```bash
+rm -f data/comet_search_download.log
+```
+
+## Troubleshooting
+
+- `Could not find a Python environment that can run Comet`
+  - Install the project into `.venv` and run the script with `./.venv/bin/python`.
+- `Comet did not become healthy`
+  - Check [`data/comet_search_download.log`](/home/johanw/repos/comet/data/comet_search_download.log).
+- `No streams matched`
+  - The selected title may not have suitable 4K/1080p English-friendly results at that moment.
+- `The selected torrent is not cached yet`
+  - Pick a result marked `cached` in the CLI output.
+- Download filename looks generic
+  - The script will automatically fall back to a readable name based on the chosen title and resolution.

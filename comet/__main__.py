@@ -1,6 +1,4 @@
-import asyncio
-
-from .db_cli import main
+from comet.main import run
 
 if __name__ == "__main__":
-    asyncio.run(main())
+    run()
