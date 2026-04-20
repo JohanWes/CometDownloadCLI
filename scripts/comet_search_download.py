@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import gzip
+import io
 import json
 import os
 import re
@@ -12,13 +14,14 @@ import tempfile
 import threading
 import time
 import urllib.request
+import zipfile
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urljoin
+from urllib.parse import urlencode, urljoin, urlparse
 from urllib.request import Request, urlopen
 
 if os.name == "posix":
@@ -61,10 +64,17 @@ REALDEBRID_ENV_KEY = "REALDEBRID_API_TOKEN"
 TORBOX_ENV_KEY = "TORBOX_API_TOKEN"
 DOWNLOAD_DIR_ENV_KEY = "COMET_DOWNLOAD_DIR"
 PUBLIC_API_TOKEN_ENV_KEY = "PUBLIC_API_TOKEN"
+OPENSUBTITLES_API_KEY_ENV_KEY = "OPENSUBTITLES_API_KEY"
+OPENSUBTITLES_USERNAME_ENV_KEY = "OPENSUBTITLES_USERNAME"
+OPENSUBTITLES_PASSWORD_ENV_KEY = "OPENSUBTITLES_PASSWORD"
 HEALTHCHECK_TIMEOUT = 60
 STREAM_RESULT_LIMIT = 3
 STARTUP_LOG_PATH = ROOT_DIR / "data" / "comet_search_download.log"
 CLI_LOG_LOCK = threading.Lock()
+OPENSUBTITLES_SESSION_LOCK = threading.Lock()
+OPENSUBTITLES_SESSION_CACHE: dict[tuple[str, str, str], tuple[str, str]] = {}
+OPENSUBTITLES_DEFAULT_BASE_URL = "https://api.opensubtitles.com/api/v1"
+OPENSUBTITLES_USER_AGENT = "CometDownloadCLI v0.1.0"
 DEFAULT_TMDB_READ_ACCESS_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJlNTkxMmVmOWFhM2IxNzg2Zjk3ZTE1NWY1YmQ3ZjY1MSIsInN1YiI6IjY1M2NjNWUyZTg5NGE2MDBmZjE2N2FmYyIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.xrIXsMFJpI1o1j5g2QpQcFP1X3AfRjFA5FlBFO5Naw8"
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 TMDB_HEADERS = {
@@ -109,7 +119,14 @@ def redact_sensitive_text(value: str) -> str:
     redacted = re.sub(r"([?&]token=)[^&\s]+", r"\1[redacted]", redacted)
 
     env_values = load_env_values()
-    for key in (REALDEBRID_ENV_KEY, TORBOX_ENV_KEY, PUBLIC_API_TOKEN_ENV_KEY):
+    for key in (
+        REALDEBRID_ENV_KEY,
+        TORBOX_ENV_KEY,
+        PUBLIC_API_TOKEN_ENV_KEY,
+        OPENSUBTITLES_API_KEY_ENV_KEY,
+        OPENSUBTITLES_USERNAME_ENV_KEY,
+        OPENSUBTITLES_PASSWORD_ENV_KEY,
+    ):
         token = os.environ.get(key, env_values.get(key, "")).strip()
         if token:
             redacted = redacted.replace(token, "[redacted]")
@@ -175,6 +192,17 @@ class DebridConfig:
     @property
     def label(self) -> str:
         return str(DEBRID_PROVIDERS[self.provider]["label"])
+
+
+@dataclass(frozen=True)
+class OpenSubtitlesConfig:
+    api_key: str
+    username: str
+    password: str
+
+    @property
+    def is_configured(self) -> bool:
+        return bool(self.api_key and self.username and self.password)
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -261,6 +289,10 @@ class DownloadJob:
     label: str
     host: str
     candidate: StreamCandidate
+    subtitles: OpenSubtitlesConfig
+    media: MediaCandidate
+    season: int | None
+    episode: int | None
     output_dir: Path
     staging_dir: Path
     fallback_name: str
@@ -1315,6 +1347,19 @@ class JobReporter:
             eta_seconds=None,
         )
 
+    def set_downloading_subtitles(self) -> None:
+        self._manager.update_job(
+            self._job_id,
+            status="downloading",
+            phase="Downloading subtitles",
+            current_file_index=None,
+            current_file_name="",
+            downloaded_bytes=0,
+            total_bytes=None,
+            speed_bytes_per_second=0.0,
+            eta_seconds=None,
+        )
+
 
 class DownloadManager:
     def __init__(
@@ -1343,6 +1388,10 @@ class DownloadManager:
         label: str,
         host: str,
         candidate: StreamCandidate,
+        subtitles: OpenSubtitlesConfig,
+        media: MediaCandidate,
+        season: int | None,
+        episode: int | None,
         output_dir: Path,
         fallback_name: str,
     ) -> DownloadJobSnapshot:
@@ -1356,6 +1405,10 @@ class DownloadManager:
                 label=label,
                 host=host,
                 candidate=candidate,
+                subtitles=subtitles,
+                media=media,
+                season=season,
+                episode=episode,
                 output_dir=output_dir,
                 staging_dir=build_staging_dir(output_dir, job_id),
                 fallback_name=fallback_name,
@@ -1402,6 +1455,28 @@ class DownloadManager:
                     job.staging_dir,
                     job.output_dir,
                 )
+                reporter.set_downloading_subtitles()
+                expected_subtitles = len(build_subtitle_targets(job, destinations))
+                try:
+                    subtitle_destinations = download_subtitles_for_job(job, destinations)
+                except Exception as subtitle_error:
+                    self._emit(
+                        "warning",
+                        f"Subtitle download skipped for job #{job_id}: {subtitle_error}",
+                    )
+                else:
+                    if subtitle_destinations:
+                        destinations.extend(subtitle_destinations)
+                        self._emit(
+                            "success",
+                            f"Saved {len(subtitle_destinations)} subtitle"
+                            f"{'s' if len(subtitle_destinations) != 1 else ''} for job #{job_id}",
+                        )
+                    if len(subtitle_destinations) < expected_subtitles:
+                        self._emit(
+                            "warning",
+                            f"OpenSubtitles returned {len(subtitle_destinations)}/{expected_subtitles} subtitles for job #{job_id}",
+                        )
             except DownloadCancelled:
                 cleanup_download_dir(job.staging_dir)
                 self._mark_cancelled(job_id, "Cancelled")
@@ -1769,6 +1844,34 @@ def load_debrid_config(provider_override: str | None, cli_token: str | None) -> 
     )
 
 
+def load_opensubtitles_config() -> OpenSubtitlesConfig:
+    env_values = load_env_values()
+    api_key = configured_env_value(env_values, OPENSUBTITLES_API_KEY_ENV_KEY)
+    username = configured_env_value(env_values, OPENSUBTITLES_USERNAME_ENV_KEY)
+    password = configured_env_value(env_values, OPENSUBTITLES_PASSWORD_ENV_KEY)
+
+    if api_key and username and password:
+        return OpenSubtitlesConfig(api_key=api_key, username=username, password=password)
+
+    if not sys.stdin.isatty():
+        return OpenSubtitlesConfig(api_key=api_key, username=username, password=password)
+
+    UI.info("OpenSubtitles API key, username, and password are required for subtitle downloads.")
+    if not api_key:
+        api_key = UI.prompt("OpenSubtitles API key: ").strip()
+    if not username:
+        username = UI.prompt("OpenSubtitles username: ").strip()
+    if not password:
+        password = UI.prompt("OpenSubtitles password: ").strip()
+
+    if api_key and username and password:
+        upsert_env_value(ENV_PATH, OPENSUBTITLES_API_KEY_ENV_KEY, api_key)
+        upsert_env_value(ENV_PATH, OPENSUBTITLES_USERNAME_ENV_KEY, username)
+        upsert_env_value(ENV_PATH, OPENSUBTITLES_PASSWORD_ENV_KEY, password)
+
+    return OpenSubtitlesConfig(api_key=api_key, username=username, password=password)
+
+
 def resolve_output_dir(cli_output_dir: str | None) -> tuple[Path, bool]:
     if cli_output_dir:
         path = Path(cli_output_dir).expanduser().resolve()
@@ -1800,6 +1903,29 @@ def http_json(
         raise RuntimeError(f"GET {url} failed with HTTP {error.code}: {body[:200]}")
     except URLError as error:
         raise RuntimeError(f"GET {url} failed: {error.reason}")
+
+
+def http_post_json(
+    url: str,
+    payload: dict[str, Any],
+    *,
+    headers: dict[str, str] | None = None,
+    timeout: int = 30,
+) -> dict[str, Any]:
+    request = Request(
+        url,
+        data=json.dumps(payload).encode("utf-8"),
+        headers=headers or {},
+        method="POST",
+    )
+    try:
+        with urlopen(request, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
+    except HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace")
+        raise RuntimeError(f"POST {url} failed with HTTP {error.code}: {body[:200]}")
+    except URLError as error:
+        raise RuntimeError(f"POST {url} failed: {error.reason}")
 
 
 def http_response(
@@ -2517,6 +2643,277 @@ def download_selected_stream(
     )
 
 
+def opensubtitles_headers(
+    config: OpenSubtitlesConfig,
+    token: str | None = None,
+    *,
+    content_type: bool = False,
+) -> dict[str, str]:
+    headers = {
+        "Accept": "application/json",
+        "Api-Key": config.api_key,
+        "User-Agent": OPENSUBTITLES_USER_AGENT,
+    }
+    if content_type:
+        headers["Content-Type"] = "application/json"
+    if token:
+        headers["Authorization"] = f"Bearer {token}"
+    return headers
+
+
+def normalize_opensubtitles_base_url(value: str) -> str:
+    value = value.strip()
+    if not value:
+        return OPENSUBTITLES_DEFAULT_BASE_URL
+    if not value.startswith(("http://", "https://")):
+        value = f"https://{value}"
+    value = value.rstrip("/")
+    if value.endswith("/api/v1"):
+        return value
+    return value + "/api/v1"
+
+
+def opensubtitles_login(config: OpenSubtitlesConfig) -> tuple[str, str]:
+    cache_key = (config.api_key, config.username, config.password)
+    with OPENSUBTITLES_SESSION_LOCK:
+        cached = OPENSUBTITLES_SESSION_CACHE.get(cache_key)
+        if cached is not None:
+            return cached
+
+        payload = http_post_json(
+            f"{OPENSUBTITLES_DEFAULT_BASE_URL}/login",
+            {"username": config.username, "password": config.password},
+            headers=opensubtitles_headers(config, content_type=True),
+            timeout=30,
+        )
+        token = str(payload.get("token", "")).strip()
+        if not token:
+            raise RuntimeError("OpenSubtitles login did not return a bearer token.")
+        session = (token, normalize_opensubtitles_base_url(str(payload.get("base_url", ""))))
+        OPENSUBTITLES_SESSION_CACHE[cache_key] = session
+        return session
+
+
+def imdb_id_number(imdb_id: str) -> str:
+    return imdb_id[2:] if imdb_id.startswith("tt") else imdb_id
+
+
+def opensubtitles_moviehash(video_path: Path) -> str | None:
+    size = video_path.stat().st_size
+    chunk_size = 64 * 1024
+    if size < chunk_size * 2:
+        return None
+
+    checksum = size
+    with video_path.open("rb") as file_handle:
+        for _ in range(chunk_size // 8):
+            chunk = file_handle.read(8)
+            if len(chunk) != 8:
+                return None
+            checksum = (checksum + int.from_bytes(chunk, "little", signed=False)) & 0xFFFFFFFFFFFFFFFF
+
+        file_handle.seek(max(size - chunk_size, 0))
+        for _ in range(chunk_size // 8):
+            chunk = file_handle.read(8)
+            if len(chunk) != 8:
+                return None
+            checksum = (checksum + int.from_bytes(chunk, "little", signed=False)) & 0xFFFFFFFFFFFFFFFF
+
+    return f"{checksum:016x}"
+
+
+def subtitle_rank(item: dict[str, Any]) -> tuple[float, int, int, int]:
+    attributes = item.get("attributes") or {}
+    ratings = float(attributes.get("ratings") or 0)
+    votes = int(attributes.get("votes") or 0)
+    points = int(attributes.get("points") or 0)
+    downloads = int(attributes.get("download_count") or attributes.get("new_download_count") or 0)
+    return ratings, votes, points, downloads
+
+
+def select_best_subtitle_file(search_payload: dict[str, Any]) -> int | None:
+    rows = [item for item in search_payload.get("data", []) if isinstance(item, dict)]
+    rows.sort(key=subtitle_rank, reverse=True)
+    for row in rows:
+        attributes = row.get("attributes") or {}
+        if attributes.get("foreign_parts_only") is True:
+            continue
+        files = attributes.get("files") or []
+        for file_info in files:
+            if not isinstance(file_info, dict):
+                continue
+            file_id = file_info.get("file_id")
+            try:
+                return int(file_id)
+            except (TypeError, ValueError):
+                continue
+    return None
+
+
+def find_best_english_subtitle_file_id(
+    config: OpenSubtitlesConfig,
+    token: str,
+    base_url: str,
+    *,
+    imdb_id: str,
+    video_path: Path,
+    season: int | None = None,
+    episode: int | None = None,
+) -> int | None:
+    base_params = {
+        "imdb_id": imdb_id_number(imdb_id),
+        "languages": "en",
+        "order_by": "ratings",
+        "order_direction": "desc",
+    }
+    if season is not None:
+        base_params["season_number"] = str(season)
+    if episode is not None:
+        base_params["episode_number"] = str(episode)
+
+    moviehash = opensubtitles_moviehash(video_path)
+    if moviehash is not None:
+        hash_params = {
+            "moviehash": moviehash,
+            "moviebytesize": str(video_path.stat().st_size),
+            "languages": "en",
+            "order_by": "ratings",
+            "order_direction": "desc",
+        }
+        url = f"{base_url}/subtitles?{urlencode(hash_params)}"
+        payload = http_json(url, headers=opensubtitles_headers(config, token), timeout=30)
+        file_id = select_best_subtitle_file(payload)
+        if file_id is not None:
+            return file_id
+
+    url = f"{base_url}/subtitles?{urlencode(base_params)}"
+    payload = http_json(url, headers=opensubtitles_headers(config, token), timeout=30)
+    return select_best_subtitle_file(payload)
+
+
+def subtitle_bytes_from_download(raw: bytes, content_type: str, source_url: str) -> bytes:
+    lower_url = urlparse(source_url).path.lower()
+    if "gzip" in content_type.lower() or lower_url.endswith(".gz"):
+        return gzip.decompress(raw)
+    if "zip" in content_type.lower() or lower_url.endswith(".zip"):
+        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
+            subtitle_names = [
+                name for name in archive.namelist() if name.lower().endswith((".srt", ".vtt", ".sub"))
+            ]
+            if not subtitle_names:
+                raise RuntimeError("OpenSubtitles archive did not contain a subtitle file.")
+            with archive.open(subtitle_names[0]) as file_handle:
+                return file_handle.read()
+    return raw
+
+
+def write_subtitle_sidecar(video_path: Path, subtitle_bytes: bytes) -> Path:
+    destination = video_path.with_suffix(".en.srt")
+    suffix = 1
+    while destination.exists():
+        destination = video_path.with_name(f"{video_path.stem}.en ({suffix}).srt")
+        suffix += 1
+    destination.write_bytes(subtitle_bytes)
+    return destination
+
+
+def download_opensubtitle_file(
+    config: OpenSubtitlesConfig,
+    token: str,
+    base_url: str,
+    file_id: int,
+    video_path: Path,
+) -> Path:
+    payload = http_post_json(
+        f"{base_url}/download",
+        {"file_id": file_id, "sub_format": "srt"},
+        headers=opensubtitles_headers(config, token, content_type=True),
+        timeout=30,
+    )
+    link = str(payload.get("link", "")).strip()
+    if not link:
+        raise RuntimeError("OpenSubtitles download response did not include a link.")
+
+    request = Request(link, headers={"User-Agent": OPENSUBTITLES_USER_AGENT})
+    try:
+        with urlopen(request, timeout=60) as response:
+            raw = response.read()
+            content_type = response.headers.get("Content-Type", "")
+    except HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace").strip()
+        detail = body[:200] if body else error.reason
+        raise RuntimeError(f"OpenSubtitles file download returned HTTP {error.code}: {detail}") from error
+    except URLError as error:
+        raise RuntimeError(f"OpenSubtitles file download failed: {error.reason}") from error
+
+    return write_subtitle_sidecar(video_path, subtitle_bytes_from_download(raw, content_type, link))
+
+
+def episode_number_from_filename(path: Path) -> int | None:
+    filename = path.name
+    for pattern in (
+        r"\bS\d{1,2}E(\d{1,3})\b",
+        r"\b\d{1,2}x(\d{1,3})\b",
+        r"\b(?:E|EP|Episode)[ ._-]*(\d{1,3})\b",
+    ):
+        match = re.search(pattern, filename, re.IGNORECASE)
+        if match:
+            try:
+                return int(match.group(1))
+            except ValueError:
+                return None
+    return None
+
+
+def build_subtitle_targets(job: DownloadJob, video_paths: list[Path]) -> list[tuple[Path, int | None, int | None]]:
+    if job.media.media_type == "movie":
+        return [(path, None, None) for path in video_paths]
+    if job.episode is not None:
+        return [(path, job.season, job.episode) for path in video_paths]
+
+    targets: list[tuple[Path, int | None, int | None]] = []
+    for index, path in enumerate(video_paths, start=1):
+        episode = episode_number_from_filename(path) or index
+        targets.append((path, job.season, episode))
+    return targets
+
+
+def download_subtitles_for_job(job: DownloadJob, video_paths: list[Path]) -> list[Path]:
+    if not job.subtitles.is_configured:
+        raise RuntimeError(
+            "OpenSubtitles is not configured. Set OPENSUBTITLES_API_KEY, "
+            "OPENSUBTITLES_USERNAME, and OPENSUBTITLES_PASSWORD."
+        )
+
+    token, base_url = opensubtitles_login(job.subtitles)
+    subtitle_paths: list[Path] = []
+    failures: list[str] = []
+    for video_path, season, episode in build_subtitle_targets(job, video_paths):
+        label = f"S{season:02d}E{episode:02d}" if season and episode else job.media.title
+        try:
+            file_id = find_best_english_subtitle_file_id(
+                job.subtitles,
+                token,
+                base_url,
+                imdb_id=job.media.imdb_id,
+                video_path=video_path,
+                season=season,
+                episode=episode,
+            )
+            if file_id is None:
+                failures.append(f"{label}: no English result")
+                continue
+            subtitle_paths.append(
+                download_opensubtitle_file(job.subtitles, token, base_url, file_id, video_path)
+            )
+        except Exception as error:
+            failures.append(f"{label}: {error}")
+            continue
+    if failures and not subtitle_paths:
+        raise RuntimeError("; ".join(failures[:3]))
+    return subtitle_paths
+
+
 def emit_ui_event(level: str, message: str) -> None:
     if level == "success":
         UI.success(message)
@@ -2532,6 +2929,7 @@ def queue_download_for_query(
     *,
     host: str,
     debrid: DebridConfig,
+    subtitles: OpenSubtitlesConfig,
     base_output_dir: Path,
     manager: DownloadManager,
     query: str,
@@ -2575,6 +2973,10 @@ def queue_download_for_query(
         label=preferred_name,
         host=host,
         candidate=selected_stream,
+        subtitles=subtitles,
+        media=chosen_media,
+        season=season,
+        episode=episode,
         output_dir=target_dir,
         fallback_name=preferred_name,
     )
@@ -2619,6 +3021,7 @@ def handle_command(raw_command: str, manager: DownloadManager) -> bool:
 def main() -> None:
     args = parse_args()
     debrid = load_debrid_config(args.provider, args.token)
+    subtitles = load_opensubtitles_config()
     base_output_dir, output_saved = resolve_output_dir(args.output_dir)
     manager = DownloadManager(args.parallel_downloads, event_callback=emit_ui_event)
     UI.bind_download_manager(manager)
@@ -2638,6 +3041,13 @@ def main() -> None:
             f"Using {debrid.label}. Download queue ready. Running up to {args.parallel_downloads} download"
             f"{'s' if args.parallel_downloads != 1 else ''} at once."
         )
+        if subtitles.is_configured:
+            UI.info("OpenSubtitles English subtitle downloads are enabled.")
+        else:
+            UI.warning(
+                "OpenSubtitles is not configured; set OPENSUBTITLES_API_KEY, "
+                "OPENSUBTITLES_USERNAME, and OPENSUBTITLES_PASSWORD to enable subtitles."
+            )
 
         query_override = args.query
         while True:
@@ -2660,6 +3070,7 @@ def main() -> None:
                 queue_download_for_query(
                     host=args.host,
                     debrid=debrid,
+                    subtitles=subtitles,
                     base_output_dir=base_output_dir,
                     manager=manager,
                     query=raw_value,
