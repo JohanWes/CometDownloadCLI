@@ -30,6 +30,10 @@ VIDEO_EXTENSIONS = (
     ".wmv",
 )
 RESOLUTION_MAP = {"2160P": "2160p", "4K": "2160p", "1080P": "1080p"}
+DEBRID_PROVIDERS = {
+    "realdebrid": {"stream_prefix": "RD"},
+    "torbox": {"stream_prefix": "TB"},
+}
 SEASON_PATTERN = re.compile(r"\b(?:season|s)\s*0*(\d{1,2})\b", re.IGNORECASE)
 EXTRA_FILE_PATTERN = re.compile(
     r"\b(?:sample|trailer|preview|teaser|ncop|nced|creditless|menu|extras?)\b",
@@ -72,6 +76,16 @@ class PlaybackPayload:
     torrent_title: str
 
 
+@dataclass(frozen=True)
+class DebridCredentials:
+    provider: str
+    token: str
+
+    @property
+    def stream_prefix(self) -> str:
+        return str(DEBRID_PROVIDERS[self.provider]["stream_prefix"])
+
+
 class BackendError(RuntimeError):
     pass
 
@@ -81,16 +95,19 @@ def _b64decode_json(raw: str) -> dict[str, Any]:
     return json.loads(base64.b64decode(raw + padding).decode("utf-8"))
 
 
-def parse_user_config(b64config: str) -> tuple[str, set[str], bool]:
+def parse_user_config(b64config: str) -> tuple[DebridCredentials, set[str], bool]:
     payload = _b64decode_json(b64config)
 
-    rd_token = ""
+    debrid: DebridCredentials | None = None
     for entry in payload.get("debridServices", []):
-        if entry.get("service") == "realdebrid":
-            rd_token = str(entry.get("apiKey", "")).strip()
-            break
-    if not rd_token:
-        raise BackendError("Missing Real-Debrid token in request config.")
+        provider = str(entry.get("service", "")).strip().lower()
+        if provider in DEBRID_PROVIDERS:
+            token = str(entry.get("apiKey", "")).strip()
+            if token:
+                debrid = DebridCredentials(provider=provider, token=token)
+                break
+    if debrid is None:
+        raise BackendError("Missing supported debrid provider token in request config.")
 
     enabled_resolutions: set[str] = set()
     for key, enabled in (payload.get("resolutions") or {}).items():
@@ -103,7 +120,7 @@ def parse_user_config(b64config: str) -> tuple[str, set[str], bool]:
         enabled_resolutions = {"2160p", "1080p"}
 
     require_english = "en" in set((payload.get("languages") or {}).get("required", []))
-    return rd_token, enabled_resolutions, require_english
+    return debrid, enabled_resolutions, require_english
 
 
 def parse_media_scope(media_type: str, media_id: str) -> SearchScope:
@@ -260,11 +277,14 @@ async def filter_candidates(
 
 
 async def mark_cached(
-    session: aiohttp.ClientSession, rd_token: str, scope: SearchScope, candidates: list[TorrentCandidate]
+    session: aiohttp.ClientSession,
+    debrid: DebridCredentials,
+    scope: SearchScope,
+    candidates: list[TorrentCandidate],
 ) -> None:
     headers = {
-        "X-StremThru-Store-Name": "realdebrid",
-        "X-StremThru-Store-Authorization": f"Bearer {rd_token}",
+        "X-StremThru-Store-Name": debrid.provider,
+        "X-StremThru-Store-Authorization": f"Bearer {debrid.token}",
         "User-Agent": "comet-minimal",
     }
     timeout = aiohttp.ClientTimeout(total=settings.stremthru_timeout_seconds)
@@ -323,7 +343,12 @@ def decode_playback_payload(raw: str) -> PlaybackPayload:
     )
 
 
-def build_streams(b64config: str, scope: SearchScope, candidates: list[TorrentCandidate]) -> list[dict[str, Any]]:
+def build_streams(
+    b64config: str,
+    debrid: DebridCredentials,
+    scope: SearchScope,
+    candidates: list[TorrentCandidate],
+) -> list[dict[str, Any]]:
     streams: list[dict[str, Any]] = []
     for candidate in candidates:
         playback = encode_playback_payload(
@@ -336,7 +361,9 @@ def build_streams(b64config: str, scope: SearchScope, candidates: list[TorrentCa
                 torrent_title=candidate.title,
             )
         )
-        cache_prefix = "[RD C]" if candidate.cached else "[RD]"
+        cache_prefix = (
+            f"[{debrid.stream_prefix} C]" if candidate.cached else f"[{debrid.stream_prefix}]"
+        )
         streams.append(
             {
                 "name": f"{cache_prefix} Comet {candidate.resolution}",
@@ -375,13 +402,13 @@ def _is_probable_extra(filename: str) -> bool:
 
 async def add_magnet(
     session: aiohttp.ClientSession,
-    rd_token: str,
+    debrid: DebridCredentials,
     info_hash: str,
     torrent_title: str,
 ) -> dict[str, Any]:
     headers = {
-        "X-StremThru-Store-Name": "realdebrid",
-        "X-StremThru-Store-Authorization": f"Bearer {rd_token}",
+        "X-StremThru-Store-Name": debrid.provider,
+        "X-StremThru-Store-Authorization": f"Bearer {debrid.token}",
         "User-Agent": "comet-minimal",
         "Content-Type": "application/json",
     }
@@ -401,11 +428,11 @@ async def add_magnet(
 
 
 async def generate_download_link(
-    session: aiohttp.ClientSession, rd_token: str, file_link: str
+    session: aiohttp.ClientSession, debrid: DebridCredentials, file_link: str
 ) -> str:
     headers = {
-        "X-StremThru-Store-Name": "realdebrid",
-        "X-StremThru-Store-Authorization": f"Bearer {rd_token}",
+        "X-StremThru-Store-Name": debrid.provider,
+        "X-StremThru-Store-Authorization": f"Bearer {debrid.token}",
         "User-Agent": "comet-minimal",
         "Content-Type": "application/json",
     }

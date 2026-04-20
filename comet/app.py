@@ -55,7 +55,7 @@ def _register_stream_routes(prefix: str = "") -> None:
     @app.get(f"{prefix}/{{b64config}}/stream/{{media_type}}/{{media_id:path}}.json")
     async def stream_results(b64config: str, media_type: str, media_id: str):
         try:
-            rd_token, enabled_resolutions, require_english = parse_user_config(b64config)
+            debrid, enabled_resolutions, require_english = parse_user_config(b64config)
             scope = parse_media_scope(media_type, media_id)
             session = app.state.http
             rows = await fetch_torznab_results(session, scope.imdb_id)
@@ -65,9 +65,9 @@ def _register_stream_routes(prefix: str = "") -> None:
                 enabled_resolutions=enabled_resolutions,
                 require_english=require_english,
             )
-            await mark_cached(session, rd_token, scope, candidates)
+            await mark_cached(session, debrid, scope, candidates)
             ordered = sort_candidates(candidates)
-            return {"streams": build_streams(b64config, scope, ordered)}
+            return {"streams": build_streams(b64config, debrid, scope, ordered)}
         except BackendError as error:
             raise HTTPException(status_code=400, detail=str(error)) from error
         except aiohttp.ClientResponseError as error:
@@ -76,10 +76,10 @@ def _register_stream_routes(prefix: str = "") -> None:
     @app.get(f"{prefix}/{{b64config}}/playback/{{playback_token}}")
     async def playback(b64config: str, playback_token: str):
         try:
-            rd_token, _, _ = parse_user_config(b64config)
+            debrid, _, _ = parse_user_config(b64config)
             payload = decode_playback_payload(playback_token)
             session = app.state.http
-            added = await add_magnet(session, rd_token, payload.info_hash, payload.torrent_title)
+            added = await add_magnet(session, debrid, payload.info_hash, payload.torrent_title)
             magnet = added.get("data") or {}
             status = str(magnet.get("status", "")).lower()
             if status not in {"cached", "downloaded"}:
@@ -96,7 +96,7 @@ def _register_stream_routes(prefix: str = "") -> None:
                     raise BackendError(
                         "The selected torrent file did not contain a downloadable link."
                     )
-                download_link = await generate_download_link(session, rd_token, file_link)
+                download_link = await generate_download_link(session, debrid, file_link)
                 return RedirectResponse(download_link, status_code=302)
 
             downloads = []
@@ -104,7 +104,7 @@ def _register_stream_routes(prefix: str = "") -> None:
                 file_link = str(target_file.get("link", "")).strip()
                 if not file_link:
                     continue
-                download_link = await generate_download_link(session, rd_token, file_link)
+                download_link = await generate_download_link(session, debrid, file_link)
                 downloads.append(
                     {
                         "name": str(target_file.get("name", "")).strip(),

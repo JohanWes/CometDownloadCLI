@@ -1,0 +1,53 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+VENV_DIR="$ROOT_DIR/.venv"
+VENV_PYTHON="$VENV_DIR/bin/python"
+INSTALL_STAMP="$VENV_DIR/.comet-install.stamp"
+
+find_python() {
+    if [[ -n "${PYTHON:-}" ]]; then
+        printf '%s\n' "$PYTHON"
+        return
+    fi
+
+    if command -v python3.13 >/dev/null 2>&1; then
+        command -v python3.13
+        return
+    fi
+
+    if command -v python3 >/dev/null 2>&1; then
+        command -v python3
+        return
+    fi
+
+    printf 'Could not find python3.13 or python3 on PATH.\n' >&2
+    exit 1
+}
+
+check_python_version() {
+    "$1" - <<'PY'
+import sys
+
+if sys.version_info < (3, 13):
+    version = ".".join(str(part) for part in sys.version_info[:3])
+    raise SystemExit(f"Comet Search Download requires Python 3.13+, found {version}.")
+PY
+}
+
+if [[ ! -x "$VENV_PYTHON" ]]; then
+    PYTHON_BIN="$(find_python)"
+    check_python_version "$PYTHON_BIN"
+    "$PYTHON_BIN" -m venv "$VENV_DIR"
+fi
+
+check_python_version "$VENV_PYTHON"
+
+if [[ ! -f "$INSTALL_STAMP" || "$ROOT_DIR/pyproject.toml" -nt "$INSTALL_STAMP" ]]; then
+    "$VENV_PYTHON" -m pip install --upgrade pip
+    "$VENV_PYTHON" -m pip install --editable "$ROOT_DIR"
+    touch "$INSTALL_STAMP"
+fi
+
+exec "$VENV_PYTHON" "$ROOT_DIR/scripts/comet_search_download.py" "$@"

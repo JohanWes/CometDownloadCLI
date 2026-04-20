@@ -9,13 +9,11 @@ requires-python = ">=3.13"
 dependencies = [
     "aiohttp",
     "fastapi",
+    "rich",
     "uvicorn",
-    "torrent-parse-rank",
+    "torrent-parse-rank @ git+https://github.com/g0ldyy/torrent-parse-rank.git",
 ]
 
 [build-system]
 requires = ["setuptools>=68"]
 build-backend = "setuptools.build_meta"
-
-[tool.uv.sources]
-torrent-parse-rank = { git = "https://github.com/g0ldyy/torrent-parse-rank" }

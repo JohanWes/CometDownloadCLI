@@ -10,6 +10,7 @@ def run() -> None:
         host=settings.fastapi_host,
         port=settings.fastapi_port,
         log_level=settings.log_level.lower(),
+        access_log=False,
     )
 
 

@@ -58,11 +58,13 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 ENV_PATH = ROOT_DIR / ".env"
 DEFAULT_HOST = "http://127.0.0.1:8000"
 REALDEBRID_ENV_KEY = "REALDEBRID_API_TOKEN"
+TORBOX_ENV_KEY = "TORBOX_API_TOKEN"
 DOWNLOAD_DIR_ENV_KEY = "COMET_DOWNLOAD_DIR"
 PUBLIC_API_TOKEN_ENV_KEY = "PUBLIC_API_TOKEN"
 HEALTHCHECK_TIMEOUT = 60
 STREAM_RESULT_LIMIT = 3
 STARTUP_LOG_PATH = ROOT_DIR / "data" / "comet_search_download.log"
+CLI_LOG_LOCK = threading.Lock()
 DEFAULT_TMDB_READ_ACCESS_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJlNTkxMmVmOWFhM2IxNzg2Zjk3ZTE1NWY1YmQ3ZjY1MSIsInN1YiI6IjY1M2NjNWUyZTg5NGE2MDBmZjE2N2FmYyIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.xrIXsMFJpI1o1j5g2QpQcFP1X3AfRjFA5FlBFO5Naw8"
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 TMDB_HEADERS = {
@@ -74,12 +76,53 @@ SAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._() -]+")
 CONTENT_DISPOSITION_FILENAME = re.compile(
     r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', re.IGNORECASE
 )
+ENGLISH_SUBTITLE_PATTERN = re.compile(
+    r"\b(?:eng(?:lish)?[ ._-]*subs?|subs?[ ._-]*eng(?:lish)?|multi[ ._-]*subs?|multisubs?|subpack|with[ ._-]*subs?)\b",
+    re.IGNORECASE,
+)
 
 RESOLUTION_RULES = {
     "4K": {"min_bytes": 3 * 1024**3, "max_bytes": 10 * 1024**3},
     "1080P": {"min_bytes": 1 * 1024**3, "max_bytes": 5 * 1024**3},
 }
 FULL_SEASON_SIZE_MULTIPLIER = 2
+DEBRID_PROVIDERS = {
+    "realdebrid": {
+        "env_key": REALDEBRID_ENV_KEY,
+        "label": "Real-Debrid",
+        "stream_prefix": "RD",
+    },
+    "torbox": {
+        "env_key": TORBOX_ENV_KEY,
+        "label": "TorBox",
+        "stream_prefix": "TB",
+    },
+}
+
+
+def redact_sensitive_text(value: str) -> str:
+    redacted = re.sub(
+        r"/[A-Za-z0-9_+=/-]{80,}/(stream|playback)/",
+        r"/[config]/\1/",
+        value,
+    )
+    redacted = re.sub(r"([?&]token=)[^&\s]+", r"\1[redacted]", redacted)
+
+    env_values = load_env_values()
+    for key in (REALDEBRID_ENV_KEY, TORBOX_ENV_KEY, PUBLIC_API_TOKEN_ENV_KEY):
+        token = os.environ.get(key, env_values.get(key, "")).strip()
+        if token:
+            redacted = redacted.replace(token, "[redacted]")
+    return redacted
+
+
+def write_cli_log(level: str, message: str) -> None:
+    timestamp = time.strftime("%Y-%m-%d %H:%M:%S")
+    line = f"{timestamp} {level.upper()}: {redact_sensitive_text(message)}\n"
+    STARTUP_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
+    with CLI_LOG_LOCK:
+        with STARTUP_LOG_PATH.open("a", encoding="utf-8") as log_file:
+            log_file.write(line)
 
 
 @dataclass
@@ -103,6 +146,7 @@ class StreamCandidate:
     is_strict_match: bool
     preferred_distance_bytes: int
     fallback_reason: str = ""
+    has_subtitle_hint: bool = False
 
 
 @dataclass(frozen=True)
@@ -116,6 +160,21 @@ class SizePreferenceContext:
 class LaunchCommand:
     argv: list[str]
     description: str
+
+
+@dataclass(frozen=True)
+class DebridConfig:
+    provider: str
+    token: str
+    token_saved: bool
+
+    @property
+    def env_key(self) -> str:
+        return str(DEBRID_PROVIDERS[self.provider]["env_key"])
+
+    @property
+    def label(self) -> str:
+        return str(DEBRID_PROVIDERS[self.provider]["label"])
 
 
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
@@ -189,6 +248,10 @@ class InputShield:
 
 
 class DownloadCancelled(Exception):
+    pass
+
+
+class PromptCancelled(Exception):
     pass
 
 
@@ -406,9 +469,11 @@ class TerminalUI:
             else:
                 print()
 
-    def prompt(self, prompt: str) -> str:
+    def prompt(self, prompt: str, *, allow_back: bool = False) -> str:
         if self.live_enabled():
-            return self._prompt_live(prompt)
+            return self._prompt_live(prompt, allow_back=allow_back)
+        if allow_back and sys.stdin.isatty() and os.name == "posix" and termios is not None:
+            return self._prompt_cancelable(prompt)
         if self.console:
             return self.console.input(f"[accent]{escape(prompt)}[/accent]")
         return input(prompt)
@@ -475,7 +540,7 @@ class TerminalUI:
             )
         )
 
-    def _prompt_live(self, prompt: str) -> str:
+    def _prompt_live(self, prompt: str, *, allow_back: bool = False) -> str:
         fd = sys.stdin.fileno()
         old_settings = termios.tcgetattr(fd)
         new_settings = termios.tcgetattr(fd)
@@ -494,6 +559,12 @@ class TerminalUI:
             while True:
                 ready, _, _ = select.select([fd], [], [], 0.1)
                 if not ready:
+                    if pending_escape:
+                        pending_escape = False
+                        escape_sequence = ""
+                        if self._input_mode == "query" and allow_back:
+                            raise PromptCancelled
+                        self._handle_browser_escape()
                     continue
 
                 chunk = os.read(fd, 32)
@@ -541,6 +612,62 @@ class TerminalUI:
                 self._prompt_buffer = ""
             termios.tcsetattr(fd, termios.TCSANOW, old_settings)
             self.refresh()
+
+    def _prompt_cancelable(self, prompt: str) -> str:
+        if self.console:
+            self.console.print(f"[accent]{escape(prompt)}[/accent]", end="")
+        else:
+            print(prompt, end="", flush=True)
+
+        fd = sys.stdin.fileno()
+        old_settings = termios.tcgetattr(fd)
+        new_settings = termios.tcgetattr(fd)
+        new_settings[3] &= ~(termios.ECHO | termios.ICANON)
+        new_settings[6][termios.VMIN] = 0
+        new_settings[6][termios.VTIME] = 0
+        termios.tcsetattr(fd, termios.TCSANOW, new_settings)
+
+        buffer = ""
+        pending_escape = False
+        try:
+            while True:
+                ready, _, _ = select.select([fd], [], [], 0.1)
+                if not ready:
+                    if pending_escape:
+                        print()
+                        raise PromptCancelled
+                    continue
+
+                chunk = os.read(fd, 32)
+                if not chunk:
+                    continue
+
+                for byte in chunk:
+                    char = chr(byte)
+                    if pending_escape:
+                        pending_escape = False
+                        if char in ("[", "O"):
+                            continue
+                        print()
+                        raise PromptCancelled
+                    if char == "\x1b":
+                        pending_escape = True
+                        continue
+                    if char in ("\r", "\n"):
+                        print()
+                        return buffer
+                    if char in ("\x7f", "\b"):
+                        if buffer:
+                            buffer = buffer[:-1]
+                            print("\b \b", end="", flush=True)
+                        continue
+                    if char == "\x04":
+                        raise EOFError
+                    if char.isprintable():
+                        buffer += char
+                        print(char, end="", flush=True)
+        finally:
+            termios.tcsetattr(fd, termios.TCSANOW, old_settings)
 
     def _handle_live_escape_sequence(self, sequence: str) -> bool:
         if sequence in {"[A", "OA"}:
@@ -713,6 +840,7 @@ class TerminalUI:
         help_table = Table.grid(expand=True)
         help_table.add_column(style="accent", ratio=1)
         help_table.add_column(style="muted", ratio=3)
+        help_table.add_row("Esc", "Cancel the current selection prompt and return to search.")
         help_table.add_row("/jobs", "Open the live job browser. Use arrows, Enter, and Esc/q.")
         help_table.add_row("/clear-finished", "Drop completed, failed, and cancelled jobs from this session.")
         help_table.add_row("/help", "Show command help.")
@@ -788,6 +916,8 @@ class TerminalUI:
                         if item.is_strict_match
                         else f"fallback: {item.fallback_reason}"
                     )
+                    if item.has_subtitle_hint:
+                        label += ", subtitle hint"
                     print(
                         f"  {item.index}. {item.name} | {format_bytes(item.size_bytes)} | {status} | {label}"
                     )
@@ -819,6 +949,8 @@ class TerminalUI:
                         if item.is_strict_match
                         else f"fallback: {item.fallback_reason}"
                     )
+                    if item.has_subtitle_hint:
+                        fit += "\nsubtitle hint"
                     release = escape(item.name)
                     if item.description:
                         release += f"\n{escape(item.description.splitlines()[0])}"
@@ -858,6 +990,7 @@ class TerminalUI:
         message = f"Queued job #{job.job_id}: {job.label} -> {job.output_dir}"
         if self.live_enabled():
             self.success(message)
+            self.show_help()
             return
         self.success(message)
 
@@ -1148,7 +1281,12 @@ class JobReporter:
     ) -> None:
         eta = None
         if total_bytes is not None and speed > 0:
-            eta = max(total_bytes - downloaded_bytes, 0) / speed
+            if total_files > 1:
+                estimated_total_bytes = total_bytes * total_files
+                estimated_done_bytes = (total_bytes * completed_files) + downloaded_bytes
+                eta = max(estimated_total_bytes - estimated_done_bytes, 0) / speed
+            else:
+                eta = max(total_bytes - downloaded_bytes, 0) / speed
         self._manager.update_job(
             self._job_id,
             status="downloading",
@@ -1432,6 +1570,7 @@ class DownloadManager:
         self._emit("warning", f"Job #{job_id} cancelled: {label}")
 
     def _emit(self, level: str, message: str) -> None:
+        write_cli_log(level, message)
         if self._event_callback is not None:
             self._event_callback(level, message)
 
@@ -1473,10 +1612,15 @@ def is_temp_directory(path: Path) -> bool:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Search Comet with a Real-Debrid token and download a result."
+        description="Search Comet with a debrid provider token and download a result."
     )
     parser.add_argument("--query", help="Movie or show title to search for.")
-    parser.add_argument("--token", help="Real-Debrid API token. Saved to .env.")
+    parser.add_argument(
+        "--provider",
+        choices=sorted(DEBRID_PROVIDERS),
+        help="Debrid provider to use. If omitted, the CLI prompts when needed.",
+    )
+    parser.add_argument("--token", help="Debrid provider API token. Saved to .env.")
     parser.add_argument("--output-dir", help="Download directory.")
     parser.add_argument("--host", default=DEFAULT_HOST, help="Comet base URL.")
     parser.add_argument(
@@ -1557,19 +1701,72 @@ def load_env_values() -> dict[str, str]:
     return values
 
 
-def load_token(cli_token: str | None) -> tuple[str, bool]:
+def configured_env_value(env_values: dict[str, str], key: str) -> str:
+    return os.environ.get(key, env_values.get(key, "")).strip()
+
+
+def prompt_debrid_provider() -> str:
+    choices = [("1", "realdebrid"), ("2", "torbox")]
+    UI.info("Choose debrid provider:")
+    for number, provider in choices:
+        label = DEBRID_PROVIDERS[provider]["label"]
+        UI.info(f"{number}. {label}")
+
+    by_number = {number: provider for number, provider in choices}
+    by_name = {provider: provider for _, provider in choices}
+    while True:
+        raw_value = UI.prompt("Provider [1/2]: ").strip().lower()
+        provider = by_number.get(raw_value) or by_name.get(raw_value)
+        if provider:
+            return provider
+        UI.warning("Enter 1 for Real-Debrid or 2 for TorBox.")
+
+
+def choose_debrid_provider(provider_override: str | None, env_values: dict[str, str]) -> str:
+    if provider_override:
+        return provider_override
+
+    has_real_debrid = bool(configured_env_value(env_values, REALDEBRID_ENV_KEY))
+    has_torbox = bool(configured_env_value(env_values, TORBOX_ENV_KEY))
+
+    if has_real_debrid and not has_torbox:
+        return "realdebrid"
+    if has_torbox and not has_real_debrid:
+        return "torbox"
+
+    if sys.stdin.isatty():
+        return prompt_debrid_provider()
+
+    return "realdebrid"
+
+
+def load_debrid_config(provider_override: str | None, cli_token: str | None) -> DebridConfig:
+    env_values = load_env_values()
+    provider = choose_debrid_provider(provider_override, env_values)
+    provider_info = DEBRID_PROVIDERS[provider]
+    env_key = str(provider_info["env_key"])
+    label = str(provider_info["label"])
+
     if cli_token:
         token = cli_token.strip()
-        return token, upsert_env_value(ENV_PATH, REALDEBRID_ENV_KEY, token)
+        return DebridConfig(
+            provider=provider,
+            token=token,
+            token_saved=upsert_env_value(ENV_PATH, env_key, token),
+        )
 
-    token = load_env_values().get(REALDEBRID_ENV_KEY, "").strip()
+    token = configured_env_value(env_values, env_key)
     if token:
-        return token, False
+        return DebridConfig(provider=provider, token=token, token_saved=False)
 
-    token = UI.prompt("Real-Debrid API token: ").strip()
+    token = UI.prompt(f"{label} API token: ").strip()
     if not token:
-        raise SystemExit("A Real-Debrid API token is required.")
-    return token, upsert_env_value(ENV_PATH, REALDEBRID_ENV_KEY, token)
+        raise SystemExit(f"A {label} API token is required.")
+    return DebridConfig(
+        provider=provider,
+        token=token,
+        token_saved=upsert_env_value(ENV_PATH, env_key, token),
+    )
 
 
 def resolve_output_dir(cli_output_dir: str | None) -> tuple[Path, bool]:
@@ -1768,9 +1965,9 @@ def ensure_comet_running(host: str, restart: bool = False) -> None:
     )
 
 
-def build_b64_config(token: str) -> str:
+def build_b64_config(provider: str, token: str) -> str:
     config: dict[str, Any] = {
-        "debridServices": [{"service": "realdebrid", "apiKey": token}],
+        "debridServices": [{"service": provider, "apiKey": token}],
         "enableTorrent": False,
         "maxResultsPerResolution": 10,
         "maxSize": 0.0,
@@ -1871,7 +2068,7 @@ def search_tmdb(query: str) -> list[MediaCandidate]:
 
 def prompt_choice(prompt: str, max_value: int) -> int:
     while True:
-        raw = UI.prompt(prompt).strip()
+        raw = UI.prompt(prompt, allow_back=True).strip()
         if raw.isdigit() and 1 <= int(raw) <= max_value:
             return int(raw)
         UI.warning(f"Enter a number between 1 and {max_value}.")
@@ -1879,7 +2076,8 @@ def prompt_choice(prompt: str, max_value: int) -> int:
 
 def choose_media(candidates: list[MediaCandidate]) -> MediaCandidate:
     if not candidates:
-        raise SystemExit("No movie or show candidates were found for that query.")
+        UI.warning("No movie or show candidates were found for that query.")
+        raise PromptCancelled
 
     UI.show_media_candidates(candidates)
     return candidates[prompt_choice("Choose a title: ", len(candidates)) - 1]
@@ -1887,8 +2085,11 @@ def choose_media(candidates: list[MediaCandidate]) -> MediaCandidate:
 
 def prompt_series_scope() -> tuple[int, int | None]:
     while True:
-        season = UI.prompt("Season number: ").strip()
-        episode = UI.prompt("Episode number (leave blank for full season): ").strip()
+        season = UI.prompt("Season number: ", allow_back=True).strip()
+        episode = UI.prompt(
+            "Episode number (leave blank for full season): ",
+            allow_back=True,
+        ).strip()
         if not season.isdigit() or int(season) <= 0:
             UI.warning("Season number must be a positive integer.")
             continue
@@ -1909,7 +2110,11 @@ def normalize_resolution(name: str) -> str | None:
 
 
 def is_cached_stream(name: str) -> bool:
-    return "⚡" in name or " C]" in name or "[RD C]" in name
+    return "⚡" in name or " C]" in name or "[RD C]" in name or "[TB C]" in name
+
+
+def has_english_subtitle_hint(*values: str) -> bool:
+    return any(ENGLISH_SUBTITLE_PATTERN.search(value or "") for value in values)
 
 
 def resolution_rule_for_context(
@@ -1969,6 +2174,10 @@ def build_stream_candidates(
                 is_strict_match=is_strict_match,
                 preferred_distance_bytes=preferred_distance_bytes,
                 fallback_reason=fallback_reason,
+                has_subtitle_hint=has_english_subtitle_hint(
+                    name,
+                    str(stream.get("description", "")),
+                ),
             )
         )
         next_index += 1
@@ -1981,11 +2190,12 @@ def group_top_streams(candidates: list[StreamCandidate]) -> list[StreamCandidate
         resolution_candidates = [item for item in candidates if item.resolution == resolution]
         strict_matches = [item for item in resolution_candidates if item.is_strict_match]
         fallback_matches = [item for item in resolution_candidates if not item.is_strict_match]
-        strict_matches.sort(key=lambda item: (not item.is_cached, item.index))
+        strict_matches.sort(key=lambda item: (not item.is_cached, not item.has_subtitle_hint, item.index))
         fallback_matches.sort(
             key=lambda item: (
                 item.preferred_distance_bytes,
                 not item.is_cached,
+                not item.has_subtitle_hint,
                 item.size_bytes,
                 item.index,
             )
@@ -2036,6 +2246,7 @@ def looks_generic_filename(filename: str) -> bool:
     normalized = filename.lower()
     return (
         normalized.startswith("rd comet ")
+        or normalized.startswith("tb comet ")
         or normalized.startswith("comet ")
         or normalized in {"download.mkv", "video.mkv", "download.bin"}
     )
@@ -2153,7 +2364,17 @@ def download_from_url_with_progress(
     if cancel_event is not None and cancel_event.is_set():
         raise DownloadCancelled()
 
-    with urlopen(download_url, timeout=300) as download_response:
+    request = Request(download_url, headers={"User-Agent": "Mozilla/5.0"})
+    try:
+        download_response = urlopen(request, timeout=300)
+    except HTTPError as error:
+        body = error.read().decode("utf-8", errors="replace").strip()
+        detail = body[:200] if body else error.reason
+        raise RuntimeError(f"Download server returned HTTP {error.code}: {detail}") from error
+    except URLError as error:
+        raise RuntimeError(f"Download server request failed: {error.reason}") from error
+
+    with download_response:
         filename = extract_filename(download_response.headers, fallback_name)
         destination, temp_destination = reserve_destination_path(output_dir, filename)
         total_bytes = download_response.headers.get("Content-Length")
@@ -2310,7 +2531,7 @@ def emit_ui_event(level: str, message: str) -> None:
 def queue_download_for_query(
     *,
     host: str,
-    token: str,
+    debrid: DebridConfig,
     base_output_dir: Path,
     manager: DownloadManager,
     query: str,
@@ -2330,7 +2551,7 @@ def queue_download_for_query(
             else f"{media_id}:{season}:{episode}"
         )
 
-    b64config = build_b64_config(token)
+    b64config = build_b64_config(debrid.provider, debrid.token)
     with UI.status("Fetching stream candidates"):
         raw_streams = fetch_streams(host, b64config, chosen_media.media_type, media_id)
         size_context = SizePreferenceContext(
@@ -2397,7 +2618,7 @@ def handle_command(raw_command: str, manager: DownloadManager) -> bool:
 
 def main() -> None:
     args = parse_args()
-    token, token_saved = load_token(args.token)
+    debrid = load_debrid_config(args.provider, args.token)
     base_output_dir, output_saved = resolve_output_dir(args.output_dir)
     manager = DownloadManager(args.parallel_downloads, event_callback=emit_ui_event)
     UI.bind_download_manager(manager)
@@ -2407,14 +2628,14 @@ def main() -> None:
     try:
         should_restart = args.restart_comet
         ensure_comet_running(args.host, restart=should_restart)
-        if token_saved:
-            UI.success(f"Saved {REALDEBRID_ENV_KEY} to {ENV_PATH}.")
+        if debrid.token_saved:
+            UI.success(f"Saved {debrid.env_key} to {ENV_PATH}.")
         if output_saved:
             UI.success(f"Saved {DOWNLOAD_DIR_ENV_KEY} to {ENV_PATH}.")
 
         UI.show_header()
         UI.info(
-            f"Download queue ready. Running up to {args.parallel_downloads} download"
+            f"Using {debrid.label}. Download queue ready. Running up to {args.parallel_downloads} download"
             f"{'s' if args.parallel_downloads != 1 else ''} at once."
         )
 
@@ -2435,13 +2656,18 @@ def main() -> None:
                     break
                 continue
 
-            queue_download_for_query(
-                host=args.host,
-                token=token,
-                base_output_dir=base_output_dir,
-                manager=manager,
-                query=raw_value,
-            )
+            try:
+                queue_download_for_query(
+                    host=args.host,
+                    debrid=debrid,
+                    base_output_dir=base_output_dir,
+                    manager=manager,
+                    query=raw_value,
+                )
+            except PromptCancelled:
+                query_override = None
+                UI.info("Returned to search.")
+                continue
     finally:
         shutdown_jobs = manager.shutdown()
         UI.stop_session()

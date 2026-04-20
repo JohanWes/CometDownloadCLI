@@ -1,8 +1,8 @@
 # Comet Search Download
 
-I needed a good CLI-based option to download files with fast Real-Debrid downloads for offline use, plane trips, and similar cases, so I built this tool from a fork of Comet.
+I needed a good CLI-based option to download files with fast debrid downloads for offline use, plane trips, and similar cases, so I built this tool from a fork of Comet.
 
-This project has nothing to do with Stremio-style streaming. It does not stream video files. It searches, queues, and downloads them with a clean terminal UI, and you need to supply your own Real-Debrid API key.
+This project has nothing to do with Stremio-style streaming. It does not stream video files. It searches, queues, and downloads them with a clean terminal UI, and you need to supply your own Real-Debrid or TorBox API key.
 
 ## What It Does
 
@@ -18,7 +18,7 @@ This project has nothing to do with Stremio-style streaming. It does not stream 
 - Python 3.13+
 - Python `venv` support
 - `git`
-- a Real-Debrid account and API token
+- a Real-Debrid or TorBox account and API token
 
 ## Quick Start
 
@@ -30,10 +30,25 @@ From the repo root:
 
 On first run, `./cometCLI` will create `.venv` if needed, install dependencies, and launch the downloader.
 
-Create `.env` from [`.env-sample`](/home/johanw/repos/comet/.env-sample) and set:
+On first run, choose your debrid provider, then paste that provider's API token:
+
+```text
+1. Real-Debrid
+2. TorBox
+```
+
+You can also create `.env` from [`.env-sample`](.env-sample) and set one provider token:
 
 ```dotenv
 REALDEBRID_API_TOKEN=your_token_here
+# or
+TORBOX_API_TOKEN=your_token_here
+```
+
+If only `TORBOX_API_TOKEN` is set, `./cometCLI` uses TorBox automatically. If only `REALDEBRID_API_TOKEN` is set, it uses Real-Debrid automatically. If both are set, choose explicitly:
+
+```bash
+./cometCLI --provider torbox
 ```
 
 ## Useful Commands
@@ -48,6 +63,7 @@ Useful options:
 
 ```bash
 ./cometCLI --query "Example Title"
+./cometCLI --provider torbox --query "Example Title"
 ./cometCLI --restart-comet
 ./cometCLI --output-dir ~/Downloads
 ./cometCLI --parallel-downloads 3
@@ -63,6 +79,8 @@ Inside the live CLI:
 ```
 
 In the `/jobs` view, use the arrow keys to select a job, `Enter` to open the cancel prompt, and `Esc` or `q` to return to normal search mode.
+
+While choosing a title, season, episode, or stream, press `Esc` to cancel that search and return to the main search prompt.
 
 ## How It Works
 
@@ -82,7 +100,7 @@ In the `/jobs` view, use the arrow keys to select a job, `Enter` to open the can
 ## Troubleshooting
 
 - `Comet did not become healthy`
-  - Check [`data/comet_search_download.log`](/home/johanw/repos/comet/data/comet_search_download.log).
+  - Check `data/comet_search_download.log`.
 - `No streams matched`
   - The selected title may not have suitable cached results right now.
 - `The selected torrent is not cached yet`
