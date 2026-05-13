@@ -2,10 +2,14 @@ package com.johanwes.cometdownload
 
 import android.Manifest
 import android.content.Context
+import android.content.Intent
 import android.content.SharedPreferences
 import android.content.pm.PackageManager
+import android.net.Uri
+import android.os.Build
 import android.os.Bundle
 import android.os.Environment
+import android.provider.Settings
 import androidx.activity.ComponentActivity
 import androidx.activity.compose.setContent
 import androidx.compose.foundation.layout.Arrangement
@@ -31,6 +35,7 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.Card
 import androidx.compose.material3.CardDefaults
 import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.darkColorScheme
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.ExposedDropdownMenuBox
@@ -83,6 +88,7 @@ class MainActivity : ComponentActivity() {
         super.onCreate(savedInstanceState)
         prefs = securePrefs()
         requestStoragePermission()
+        requestManageStoragePermission()
 
         if (!Python.isStarted()) {
             Python.start(AndroidPlatform(this))
@@ -123,6 +129,9 @@ class MainActivity : ComponentActivity() {
     }
 
     private fun requestStoragePermission() {
+        if (Build.VERSION.SDK_INT > Build.VERSION_CODES.P) {
+            return
+        }
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
             != PackageManager.PERMISSION_GRANTED
         ) {
@@ -135,6 +144,20 @@ class MainActivity : ComponentActivity() {
                 1001,
             )
         }
+    }
+
+    private fun requestManageStoragePermission() {
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.R || Environment.isExternalStorageManager()) {
+            return
+        }
+        val appIntent = Intent(
+            Settings.ACTION_MANAGE_APP_ALL_FILES_ACCESS_PERMISSION,
+            Uri.parse("package:$packageName"),
+        )
+        runCatching { startActivity(appIntent) }
+            .onFailure {
+                startActivity(Intent(Settings.ACTION_MANAGE_ALL_FILES_ACCESS_PERMISSION))
+            }
     }
 }
 
@@ -212,7 +235,7 @@ fun CometApp(api: PyObject, prefs: SharedPreferences, downloadsPath: String) {
         }
     }
 
-    MaterialTheme {
+    MaterialTheme(colorScheme = darkColorScheme()) {
         Surface(modifier = Modifier.fillMaxSize(), color = MaterialTheme.colorScheme.background) {
             Scaffold(
                 topBar = {
@@ -230,40 +253,47 @@ fun CometApp(api: PyObject, prefs: SharedPreferences, downloadsPath: String) {
                     )
                 },
             ) { padding ->
-                Row(
+                Column(
                     modifier = Modifier
                         .padding(padding)
                         .fillMaxSize()
                         .padding(16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(16.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
                 ) {
-                    Column(modifier = Modifier.weight(1.2f)) {
-                        SearchPanel(
-                            query = query,
-                            onQueryChange = { query = it },
-                            busy = busy,
-                            onSearch = {
-                                busy = true
-                                error = ""
-                                selectedMedia = null
-                                streamResults.clear()
-                                mediaResults.clear()
-                                runAsync(
-                                    block = { api.callAttr("search", query).toString() },
-                                    onDone = {
-                                        mediaResults.addAll(parseMedia(it))
-                                        busy = false
-                                    },
-                                    onError = {
-                                        error = it
-                                        busy = false
-                                    },
-                                )
-                            },
-                        )
-                        Spacer(Modifier.height(12.dp))
-                        if (error.isNotBlank()) ErrorText(error)
+                    SearchPanel(
+                        query = query,
+                        onQueryChange = { query = it },
+                        busy = busy,
+                        onSearch = {
+                            busy = true
+                            error = ""
+                            selectedMedia = null
+                            streamResults.clear()
+                            mediaResults.clear()
+                            runAsync(
+                                block = { api.callAttr("search", query).toString() },
+                                onDone = {
+                                    mediaResults.addAll(parseMedia(it))
+                                    busy = false
+                                },
+                                onError = {
+                                    error = it
+                                    busy = false
+                                },
+                            )
+                        },
+                    )
+                    if (error.isNotBlank()) ErrorText(error)
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(2f),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    ) {
                         MediaResults(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxSize(),
                             items = mediaResults,
                             selected = selectedMedia,
                             onSelect = {
@@ -273,68 +303,72 @@ fun CometApp(api: PyObject, prefs: SharedPreferences, downloadsPath: String) {
                                 episode = ""
                             },
                         )
-                        selectedMedia?.let { media ->
-                            Spacer(Modifier.height(12.dp))
-                            StreamPanel(
-                                media = media,
-                                season = season,
-                                episode = episode,
-                                onSeasonChange = { season = it.filter(Char::isDigit) },
-                                onEpisodeChange = { episode = it.filter(Char::isDigit) },
-                                streams = streamResults,
-                                busy = busy,
-                                onLoadStreams = {
-                                    busy = true
-                                    error = ""
-                                    streamResults.clear()
-                                    runAsync(
-                                        block = {
-                                            api.callAttr(
-                                                "streams",
-                                                media.json,
-                                                season.toIntOrNull() ?: 0,
-                                                episode.toIntOrNull() ?: 0,
-                                            ).toString()
-                                        },
-                                        onDone = {
-                                            streamResults.addAll(parseStreams(it))
-                                            busy = false
-                                        },
-                                        onError = {
-                                            error = it
-                                            busy = false
-                                        },
-                                    )
-                                },
-                                onDownload = { stream ->
-                                    busy = true
-                                    error = ""
-                                    runAsync(
-                                        block = {
-                                            api.callAttr(
-                                                "enqueue",
-                                                media.json,
-                                                stream.json,
-                                                season.toIntOrNull() ?: 0,
-                                                episode.toIntOrNull() ?: 0,
-                                            ).toString()
-                                        },
-                                        onDone = {
-                                            jobs.clear()
-                                            jobs.addAll(parseJobs(api.callAttr("jobs").toString()))
-                                            busy = false
-                                        },
-                                        onError = {
-                                            error = it
-                                            busy = false
-                                        },
-                                    )
-                                },
-                            )
-                        }
+                        StreamPanel(
+                            modifier = Modifier
+                                .weight(1f)
+                                .fillMaxSize(),
+                            media = selectedMedia,
+                            season = season,
+                            episode = episode,
+                            onSeasonChange = { season = it.filter(Char::isDigit) },
+                            onEpisodeChange = { episode = it.filter(Char::isDigit) },
+                            streams = streamResults,
+                            busy = busy,
+                            onLoadStreams = {
+                                val media = selectedMedia ?: return@StreamPanel
+                                busy = true
+                                error = ""
+                                streamResults.clear()
+                                runAsync(
+                                    block = {
+                                        api.callAttr(
+                                            "streams",
+                                            media.json,
+                                            season.toIntOrNull() ?: 0,
+                                            episode.toIntOrNull() ?: 0,
+                                        ).toString()
+                                    },
+                                    onDone = {
+                                        streamResults.addAll(parseStreams(it))
+                                        busy = false
+                                    },
+                                    onError = {
+                                        error = it
+                                        busy = false
+                                    },
+                                )
+                            },
+                            onDownload = { stream ->
+                                val media = selectedMedia ?: return@StreamPanel
+                                busy = true
+                                error = ""
+                                runAsync(
+                                    block = {
+                                        api.callAttr(
+                                            "enqueue",
+                                            media.json,
+                                            stream.json,
+                                            season.toIntOrNull() ?: 0,
+                                            episode.toIntOrNull() ?: 0,
+                                        ).toString()
+                                    },
+                                    onDone = {
+                                        jobs.clear()
+                                        jobs.addAll(parseJobs(api.callAttr("jobs").toString()))
+                                        busy = false
+                                    },
+                                    onError = {
+                                        error = it
+                                        busy = false
+                                    },
+                                )
+                            },
+                        )
                     }
                     JobPanel(
-                        modifier = Modifier.weight(0.9f),
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .weight(1f),
                         jobs = jobs,
                         onCancel = { id ->
                             runCatching { api.callAttr("cancel", id) }
@@ -440,19 +474,32 @@ fun SearchPanel(query: String, onQueryChange: (String) -> Unit, busy: Boolean, o
 }
 
 @Composable
-fun MediaResults(items: List<MediaItem>, selected: MediaItem?, onSelect: (MediaItem) -> Unit) {
-    LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-        items(items) { item ->
-            Card(
-                onClick = { onSelect(item) },
-                colors = CardDefaults.cardColors(
-                    containerColor = if (item == selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surface,
-                ),
+fun MediaResults(
+    modifier: Modifier = Modifier,
+    items: List<MediaItem>,
+    selected: MediaItem?,
+    onSelect: (MediaItem) -> Unit,
+) {
+    Card(modifier = modifier) {
+        Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
+            Text("Search results", fontWeight = FontWeight.SemiBold)
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
             ) {
-                Row(Modifier.padding(12.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
-                    Column(Modifier.weight(1f)) {
-                        Text(item.title, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
-                        Text("${item.mediaType} · ${item.year} · ${item.imdbId}", style = MaterialTheme.typography.bodySmall)
+                items(items) { item ->
+                    Card(
+                        onClick = { onSelect(item) },
+                        colors = CardDefaults.cardColors(
+                            containerColor = if (item == selected) MaterialTheme.colorScheme.primaryContainer else MaterialTheme.colorScheme.surfaceVariant,
+                        ),
+                    ) {
+                        Row(Modifier.padding(12.dp).fillMaxWidth(), horizontalArrangement = Arrangement.SpaceBetween) {
+                            Column(Modifier.weight(1f)) {
+                                Text(item.title, fontWeight = FontWeight.SemiBold, maxLines = 1, overflow = TextOverflow.Ellipsis)
+                                Text("${item.mediaType} · ${item.year} · ${item.imdbId}", style = MaterialTheme.typography.bodySmall)
+                            }
+                        }
                     }
                 }
             }
@@ -462,7 +509,8 @@ fun MediaResults(items: List<MediaItem>, selected: MediaItem?, onSelect: (MediaI
 
 @Composable
 fun StreamPanel(
-    media: MediaItem,
+    modifier: Modifier = Modifier,
+    media: MediaItem?,
     season: String,
     episode: String,
     onSeasonChange: (String) -> Unit,
@@ -472,10 +520,15 @@ fun StreamPanel(
     onLoadStreams: () -> Unit,
     onDownload: (StreamItem) -> Unit,
 ) {
-    Card {
+    Card(modifier = modifier) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
-            Text("Streams for ${media.title}", fontWeight = FontWeight.SemiBold)
-            if (media.mediaType == "series") {
+            Text(
+                if (media == null) "Stream selection" else "Streams for ${media.title}",
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+            )
+            if (media?.mediaType == "series") {
                 Row(horizontalArrangement = Arrangement.spacedBy(8.dp)) {
                     OutlinedTextField(
                         modifier = Modifier.weight(1f),
@@ -495,14 +548,17 @@ fun StreamPanel(
             }
             Button(
                 onClick = onLoadStreams,
-                enabled = !busy && (media.mediaType != "series" || season.isNotBlank()),
+                enabled = media != null && !busy && (media.mediaType != "series" || season.isNotBlank()),
             ) {
                 Icon(Icons.Default.Refresh, contentDescription = null)
                 Spacer(Modifier.width(8.dp))
                 Text("Load streams")
             }
-            Column(verticalArrangement = Arrangement.spacedBy(8.dp)) {
-                streams.forEach { stream ->
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
+                items(streams) { stream ->
                     Card(colors = CardDefaults.cardColors(containerColor = MaterialTheme.colorScheme.surfaceVariant)) {
                         Row(
                             Modifier.padding(12.dp).fillMaxWidth(),
@@ -540,7 +596,10 @@ fun JobPanel(modifier: Modifier, jobs: List<JobItem>, onCancel: (Int) -> Unit, o
                     Icon(Icons.Default.ClearAll, contentDescription = "Clear finished")
                 }
             }
-            LazyColumn(verticalArrangement = Arrangement.spacedBy(8.dp)) {
+            LazyColumn(
+                modifier = Modifier.fillMaxSize(),
+                verticalArrangement = Arrangement.spacedBy(8.dp),
+            ) {
                 items(jobs) { job ->
                     JobRow(job = job, onCancel = { onCancel(job.id) })
                 }
