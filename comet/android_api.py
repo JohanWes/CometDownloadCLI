@@ -320,6 +320,25 @@ def _is_video_file(name: str) -> bool:
     return name.lower().endswith(VIDEO_EXTENSIONS)
 
 
+def _season_pack_sort_key(file_info: dict[str, Any]) -> tuple[int, str]:
+    name = os.path.basename(str(file_info.get("name", ""))).lower()
+    match = re.search(
+        r"\bs\d{1,2}e0*(\d{1,3})\b|\b\d{1,2}x0*(\d{1,3})\b|\b(?:e|ep|episode)[ ._-]*0*(\d{1,3})\b",
+        name,
+        re.IGNORECASE,
+    )
+    if match:
+        for group in match.groups():
+            if group:
+                return int(group), name
+
+    leading_number = re.match(r"^\D*0*(\d{1,3})(?:\D|$)", name)
+    if leading_number:
+        return int(leading_number.group(1)), name
+
+    return 10_000, name
+
+
 def _choose_files(payload: dict[str, Any], files: list[dict[str, Any]]) -> list[dict[str, Any]]:
     video_files = [item for item in files if _is_video_file(str(item.get("name", "")))]
     if not video_files:
@@ -346,7 +365,15 @@ def _choose_files(payload: dict[str, Any], files: list[dict[str, Any]]) -> list[
                 )
             ]
             if matches:
-                return sorted(matches, key=lambda item: str(item.get("name", "")).lower())
+                return sorted(matches, key=_season_pack_sort_key)
+
+            season_pack_files = [
+                item
+                for item in video_files
+                if not EXTRA_FILE_PATTERN.search(os.path.basename(str(item.get("name", ""))))
+            ]
+            if len(season_pack_files) > 1:
+                return sorted(season_pack_files, key=_season_pack_sort_key)
     return [max(video_files, key=lambda item: int(item.get("size") or 0))]
 
 
