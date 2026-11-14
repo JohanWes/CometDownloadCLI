@@ -122,6 +122,13 @@ While choosing a title, season, episode, or stream, press `Esc` to cancel that s
   - double tap the sides to skip 10 s, the middle to pause; hold for 2x; drag up or down on the left for brightness and on the right for volume; pinch to fill the screen
   - remembers the position, subtitle and audio choice per video, and plays a season's episodes in order
 
+## Where Your Tokens Go
+
+- The debrid token is sent to your debrid service through a [StremThru](https://github.com/MunifTanjim/stremthru) server, which looks up cached torrents and creates the download links. The default is the public instance `https://stremthru.13377001.xyz`; whoever runs that server can see the token. To avoid that with the CLI, run your own StremThru and set `STREMTHRU_URL` in `.env`. The Android app always uses the public instance.
+- OpenSubtitles credentials are only sent to OpenSubtitles.
+- The CLI keeps tokens in `.env`, readable by your user only (mode 600). The Android app keeps them in encrypted preferences and excludes its data from backups.
+- Tokens are left out of the log file and of error messages.
+
 ## Notes
 
 - downloads go to `~/Downloads` by default unless overridden
