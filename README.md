@@ -64,6 +64,8 @@ OPENSUBTITLES_LANGUAGES=en, sv
 
 OpenSubtitles requires the API key for API access and a bearer token for subtitle downloads. The CLI gets that bearer token from OpenSubtitles with `OPENSUBTITLES_USERNAME` and `OPENSUBTITLES_PASSWORD`.
 
+Subtitles are optional. Leave the API key prompt blank to skip them; the CLI then saves `OPENSUBTITLES_ENABLED=false` to `.env` and stops asking. Remove that line to set subtitles up later.
+
 When these are set, each movie download gets one `.<lang>.srt` sidecar (for example `.en.srt`, or `.sv.srt` when no English subtitle exists). Full-season downloads request one subtitle per episode file, matched by the `SxxEyy` in its name; files without one are skipped rather than guessed. Results are ranked by language preference, then human over machine translations, exact file-hash matches, release-name similarity, trusted uploaders and download count. Episodes are searched by the show's IMDb id plus season/episode. The download quota and rate limits are respected, and an expired login is renewed automatically.
 
 ## Useful Commands

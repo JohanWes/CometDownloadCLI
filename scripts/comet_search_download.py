@@ -89,6 +89,7 @@ OPENSUBTITLES_API_KEY_ENV_KEY = "OPENSUBTITLES_API_KEY"
 OPENSUBTITLES_USERNAME_ENV_KEY = "OPENSUBTITLES_USERNAME"
 OPENSUBTITLES_PASSWORD_ENV_KEY = "OPENSUBTITLES_PASSWORD"
 OPENSUBTITLES_LANGUAGES_ENV_KEY = "OPENSUBTITLES_LANGUAGES"
+OPENSUBTITLES_ENABLED_ENV_KEY = "OPENSUBTITLES_ENABLED"
 HEALTHCHECK_TIMEOUT = 60
 STREAM_RESULT_LIMIT = 3
 STARTUP_LOG_PATH = ROOT_DIR / "data" / "comet_search_download.log"
@@ -2097,15 +2098,25 @@ def load_opensubtitles_config() -> OpenSubtitlesConfig:
     password = configured_env_value(env_values, OPENSUBTITLES_PASSWORD_ENV_KEY)
     languages = parse_subtitle_languages(env_values.get(OPENSUBTITLES_LANGUAGES_ENV_KEY))
 
+    if opensubtitles_disabled(env_values):
+        return OpenSubtitlesConfig(api_key="", username="", password="", languages=languages)
+
     if api_key and username and password:
         return OpenSubtitlesConfig(api_key=api_key, username=username, password=password, languages=languages)
 
     if not sys.stdin.isatty():
         return OpenSubtitlesConfig(api_key=api_key, username=username, password=password, languages=languages)
 
-    UI.info("OpenSubtitles API key, username, and password are required for subtitle downloads.")
+    UI.info("Subtitle downloads are optional and need an OpenSubtitles API key, username, and password.")
     if not api_key:
-        api_key = UI.prompt("OpenSubtitles API key: ").strip()
+        api_key = UI.prompt("OpenSubtitles API key (leave blank to skip subtitles): ").strip()
+        if not api_key:
+            # Remember the answer, otherwise these three prompts come back on every start.
+            upsert_env_value(ENV_PATH, OPENSUBTITLES_ENABLED_ENV_KEY, "false")
+            UI.info(
+                f"Subtitles are off. Remove {OPENSUBTITLES_ENABLED_ENV_KEY} from {ENV_PATH} to set them up later."
+            )
+            return OpenSubtitlesConfig(api_key="", username="", password="", languages=languages)
     if not username:
         username = UI.prompt("OpenSubtitles username: ").strip()
     if not password:
@@ -2117,6 +2128,11 @@ def load_opensubtitles_config() -> OpenSubtitlesConfig:
         upsert_env_value(ENV_PATH, OPENSUBTITLES_PASSWORD_ENV_KEY, password)
 
     return OpenSubtitlesConfig(api_key=api_key, username=username, password=password, languages=languages)
+
+
+def opensubtitles_disabled(env_values: dict[str, str]) -> bool:
+    value = configured_env_value(env_values, OPENSUBTITLES_ENABLED_ENV_KEY).lower()
+    return value in {"0", "false", "no", "off"}
 
 
 def resolve_output_dir(cli_output_dir: str | None) -> tuple[Path, bool]:
@@ -3340,6 +3356,8 @@ def main() -> None:
         )
         if subtitles.is_configured:
             UI.info(f"OpenSubtitles subtitles enabled ({_language_list(subtitles.languages)}, first found wins).")
+        elif opensubtitles_disabled(load_env_values()):
+            UI.info(f"Subtitles are off ({OPENSUBTITLES_ENABLED_ENV_KEY}=false in {ENV_PATH}).")
         else:
             UI.warning(
                 "OpenSubtitles is not configured; set OPENSUBTITLES_API_KEY, "
