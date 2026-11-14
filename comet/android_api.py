@@ -33,8 +33,14 @@ VIDEO_EXTENSIONS = (
     ".webm",
     ".wmv",
 )
-SEASON_EPISODE_PATTERN = re.compile(r"\bs0*(\d{1,2})e0*(\d{1,3})\b", re.IGNORECASE)
-SEASON_PATTERN = re.compile(r"\b(?:season|s)\s*0*(\d{1,2})\b", re.IGNORECASE)
+SEASON_EPISODE_PATTERN = re.compile(r"\bs0*(\d{1,2})e0*(\d{1,3})(?!\d)", re.IGNORECASE)
+# A season pack named in a movie result: "S02", or "Season 2" unless a year follows it
+# ("Open.Season.2.2008" is the film Open Season 2, "Open.Season.2006" has no season number at all).
+MOVIE_SEASON_PACK_PATTERN = re.compile(
+    r"\bs\d{1,2}\b|\bseason[ ._-]*\d{1,2}\b(?![ ._-]*\(?(?:19|20)\d{2}\b)",
+    re.IGNORECASE,
+)
+SEASON_PATTERN = re.compile(r"\b(?:season[ ._-]*|s\s*)0*(\d{1,2})\b", re.IGNORECASE)
 EXTRA_FILE_PATTERN = re.compile(
     r"\b(?:sample|trailer|preview|teaser|creditless|menu|extras?)\b",
     re.IGNORECASE,
@@ -293,13 +299,21 @@ def _fetch_torznab_results(imdb_id: str) -> list[dict[str, Any]]:
 
 
 def _matches_scope(title: str, media_type: str, season: int | None, episode: int | None) -> bool:
-    normalized = title.lower()
     if media_type == "movie":
-        return SEASON_EPISODE_PATTERN.search(normalized) is None and "season" not in normalized
+        # Only episode and season-pack names are out; the bare word "season" is fine
+        # (Open Season, Season of the Witch).
+        return SEASON_EPISODE_PATTERN.search(title) is None and MOVIE_SEASON_PACK_PATTERN.search(title) is None
     if season is None:
         return False
     if episode is not None:
-        return bool(re.search(rf"\bs0*{season}e0*{episode}\b|\b{season}x0*{episode}\b", title, re.IGNORECASE))
+        # Also matches the later half of a double episode: S01E01E02, S01E01-E02.
+        return bool(
+            re.search(
+                rf"\bs0*{season}(?:e\d{{1,3}}-?)*e0*{episode}(?!\d)|\b{season}x0*{episode}\b",
+                title,
+                re.IGNORECASE,
+            )
+        )
     season_match = SEASON_PATTERN.search(title)
     if season_match:
         return int(season_match.group(1)) == season and SEASON_EPISODE_PATTERN.search(title) is None
