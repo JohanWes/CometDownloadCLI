@@ -5,7 +5,9 @@ import android.text.SpannableStringBuilder
 import android.text.Spanned
 import android.text.style.StyleSpan
 import android.text.style.UnderlineSpan
+import androidx.annotation.OptIn
 import androidx.media3.common.text.Cue
+import androidx.media3.common.util.UnstableApi
 import java.io.File
 import java.nio.ByteBuffer
 import java.nio.charset.CharacterCodingException
@@ -93,7 +95,7 @@ private fun decodeText(bytes: ByteArray): String {
             .onUnmappableCharacter(CodingErrorAction.REPORT)
             .decode(ByteBuffer.wrap(bytes))
             .toString()
-            .removePrefix("﻿")
+            .removePrefix("\uFEFF")
     } catch (_: CharacterCodingException) {
         String(bytes, Charset.forName("windows-1252"))
     }
@@ -138,6 +140,7 @@ private fun timeMs(hours: String, minutes: String, seconds: String, fraction: St
         fraction.padEnd(3, '0').toLong()
 
 /** Turns `<i>`, `<b>`, `<u>` into styling, drops other tags; `{\an8}` moves the line to the top. */
+@OptIn(UnstableApi::class)
 private fun buildCue(raw: String): Cue {
     val text = SpannableStringBuilder()
     val open = HashMap<String, Int>()
