@@ -447,6 +447,29 @@ def _is_video_file(name: str) -> bool:
     return name.lower().endswith(VIDEO_EXTENSIONS)
 
 
+def _sidecars_of(video: Path, candidates) -> list[Path]:
+    """The non-video files among [candidates] that are named after [video] ("Movie.en.srt" for
+    "Movie.mkv"). A file that fits a longer-named video next to it belongs to that one instead:
+    "Movie.Extended.en.srt" goes with "Movie.Extended.mkv", not with "Movie.mkv"."""
+    try:
+        longer_stems = [
+            other.stem
+            for other in video.parent.iterdir()
+            if _is_video_file(other.name) and other.stem.startswith(video.stem + ".")
+        ]
+    except OSError:
+        longer_stems = []
+    prefix = video.stem + "."
+    return [
+        path
+        for path in candidates
+        if path.parent == video.parent
+        and path.name.startswith(prefix)
+        and not _is_video_file(path.name)
+        and not any(path.name.startswith(stem + ".") for stem in longer_stems)
+    ]
+
+
 def _season_pack_sort_key(file_info: dict[str, Any]) -> tuple[int, str]:
     name = os.path.basename(str(file_info.get("name", ""))).lower()
     match = re.search(
@@ -1107,13 +1130,8 @@ class AndroidCometApi:
             return False
         doomed: list[Path] = []
         for video in videos:
-            prefix = video.stem + "."
             doomed.append(video)
-            doomed.extend(
-                path
-                for path in job.destinations
-                if path.parent == video.parent and path.name.startswith(prefix) and not _is_video_file(path.name)
-            )
+            doomed.extend(_sidecars_of(video, job.destinations))
         videos_left = self.manager.drop_files(job_id, doomed)
         if not videos_left:
             with self._requests_lock:
@@ -1124,14 +1142,17 @@ class AndroidCometApi:
         return True
 
     def _delete_from_disk(self, files, output_dir: Path | None) -> None:
+        # Sidecars are picked before anything is deleted, while every video is still there to claim its own.
+        extras: list[Path] = []
         for path in files:
-            # Subtitles fetched in other ways (same name, other suffix) go with their video.
-            extras = path.parent.glob(glob_escape(path.stem) + ".*.srt") if _is_video_file(path.name) else ()
-            for target in (path, *extras):
-                try:
-                    target.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            if _is_video_file(path.name):
+                # Subtitles fetched in other ways (same name, other suffix) go with their video.
+                extras.extend(_sidecars_of(path, path.parent.glob(glob_escape(path.stem) + ".*.srt")))
+        for target in (*files, *extras):
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
         try:
             if output_dir is not None and output_dir != self.download_dir:
                 output_dir.rmdir()  # only when nothing else is left in it
