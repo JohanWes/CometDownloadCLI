@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 import argparse
 import base64
-import gzip
-import io
+import errno
+import http.client
 import json
 import os
 import re
@@ -13,16 +13,36 @@ import sys
 import tempfile
 import threading
 import time
+import unicodedata
 import urllib.request
-import zipfile
 from collections import deque
 from contextlib import nullcontext
 from dataclasses import dataclass, field
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urljoin, urlparse
+from urllib.parse import unquote, urlencode, urljoin
 from urllib.request import Request, urlopen
+
+_REPO_ROOT = str(Path(__file__).resolve().parents[1])
+if _REPO_ROOT not in sys.path:  # run straight from a checkout, without the package installed
+    sys.path.insert(0, _REPO_ROOT)
+
+from comet.subtitles import (  # noqa: E402
+    SUBTITLE_VIDEO_EXTENSIONS,
+    OpenSubtitlesConfig,
+    OpenSubtitlesError,
+    OpenSubtitlesQuotaError,
+    OpenSubtitlesSession,
+    download_subtitle,
+    embedded_subtitle_summary,
+    episode_number_from_filename,
+    find_subtitle,
+    mkv_subtitle_tracks,
+    parse_subtitle_languages,
+    season_episode_from_filename,
+    subtitle_language_name,
+)
 
 if os.name == "posix":
     import termios
@@ -67,14 +87,11 @@ PUBLIC_API_TOKEN_ENV_KEY = "PUBLIC_API_TOKEN"
 OPENSUBTITLES_API_KEY_ENV_KEY = "OPENSUBTITLES_API_KEY"
 OPENSUBTITLES_USERNAME_ENV_KEY = "OPENSUBTITLES_USERNAME"
 OPENSUBTITLES_PASSWORD_ENV_KEY = "OPENSUBTITLES_PASSWORD"
+OPENSUBTITLES_LANGUAGES_ENV_KEY = "OPENSUBTITLES_LANGUAGES"
 HEALTHCHECK_TIMEOUT = 60
 STREAM_RESULT_LIMIT = 3
 STARTUP_LOG_PATH = ROOT_DIR / "data" / "comet_search_download.log"
 CLI_LOG_LOCK = threading.Lock()
-OPENSUBTITLES_SESSION_LOCK = threading.Lock()
-OPENSUBTITLES_SESSION_CACHE: dict[tuple[str, str, str], tuple[str, str]] = {}
-OPENSUBTITLES_DEFAULT_BASE_URL = "https://api.opensubtitles.com/api/v1"
-OPENSUBTITLES_USER_AGENT = "CometDownloadCLI v0.1.0"
 DEFAULT_TMDB_READ_ACCESS_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJlNTkxMmVmOWFhM2IxNzg2Zjk3ZTE1NWY1YmQ3ZjY1MSIsInN1YiI6IjY1M2NjNWUyZTg5NGE2MDBmZjE2N2FmYyIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.xrIXsMFJpI1o1j5g2QpQcFP1X3AfRjFA5FlBFO5Naw8"
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 TMDB_HEADERS = {
@@ -82,9 +99,11 @@ TMDB_HEADERS = {
     "Content-Type": "application/json",
 }
 
-SAFE_FILENAME_CHARS = re.compile(r"[^A-Za-z0-9._() -]+")
+# Letters and digits of any script are kept (Sällskapsresan, Amélie); path separators,
+# control characters and everything else outside this small set become spaces.
+SAFE_FILENAME_CHARS = re.compile(r"[^\w.() -]+")
 CONTENT_DISPOSITION_FILENAME = re.compile(
-    r'filename\*?=(?:UTF-8\'\')?"?([^";]+)"?', re.IGNORECASE
+    r'filename(\*)?=(?:UTF-8\'[^\']*\')?"?([^";]+)"?', re.IGNORECASE
 )
 ENGLISH_SUBTITLE_PATTERN = re.compile(
     r"\b(?:eng(?:lish)?[ ._-]*subs?|subs?[ ._-]*eng(?:lish)?|multi[ ._-]*subs?|multisubs?|subpack|with[ ._-]*subs?)\b",
@@ -194,17 +213,6 @@ class DebridConfig:
         return str(DEBRID_PROVIDERS[self.provider]["label"])
 
 
-@dataclass(frozen=True)
-class OpenSubtitlesConfig:
-    api_key: str
-    username: str
-    password: str
-
-    @property
-    def is_configured(self) -> bool:
-        return bool(self.api_key and self.username and self.password)
-
-
 class NoRedirectHandler(urllib.request.HTTPRedirectHandler):
     def redirect_request(self, req, fp, code, msg, headers, newurl):
         return None
@@ -283,6 +291,17 @@ class PromptCancelled(Exception):
     pass
 
 
+class JobDeferred(Exception):
+    """Raised by a download backend when a job has to wait for something slow first (a
+    debrid service fetching an uncached torrent). [wait] blocks until the job is worth
+    trying again; the manager runs it off the worker pool, so the wait doesn't hold up
+    a download slot, and then puts the job back at the front of the queue."""
+
+    def __init__(self, wait: Callable[[], None]) -> None:
+        super().__init__("deferred")
+        self.wait = wait
+
+
 @dataclass
 class DownloadJob:
     job_id: int
@@ -312,6 +331,14 @@ class DownloadJob:
     destinations: list[Path] = field(default_factory=list)
     error_text: str = ""
     cancel_requested: bool = False
+    subtitle_status: str = ""
+    subtitle_message: str = ""
+    embedded_subtitles: list[str] = field(default_factory=list)
+    subtitle_file_ids: list[int] = field(default_factory=list)
+    # video file -> (its sidecar, language code), so a refetch replaces per video.
+    subtitle_sidecars: dict[Path, tuple[Path, str]] = field(default_factory=dict)
+    # OpenSubtitles file id -> the sidecar it was saved as (every one fetched, also by hand).
+    subtitle_files: dict[int, Path] = field(default_factory=dict)
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
 
@@ -336,6 +363,14 @@ class DownloadJobSnapshot:
     error_text: str
     cancel_requested: bool
     output_dir: Path
+    subtitle_status: str = ""
+    subtitle_message: str = ""
+    embedded_subtitles: tuple[str, ...] = ()
+    media_type: str = ""
+    imdb_id: str = ""
+    season: int | None = None
+    episode: int | None = None
+    title: str = ""
 
 
 class DashboardRenderable:
@@ -1288,6 +1323,10 @@ class JobReporter:
     def set_total_files(self, total_files: int) -> None:
         self._manager.update_job(self._job_id, total_files=total_files)
 
+    def update_job_phase(self, phase: str) -> None:
+        """Temporary phase text (e.g. while reconnecting); the next progress update replaces it."""
+        self._manager.update_job(self._job_id, phase=phase, speed_bytes_per_second=0.0, eta_seconds=None)
+
     def start_file(self, index: int, total_files: int, file_name: str, total_bytes: int | None) -> None:
         self._manager.update_job(
             self._job_id,
@@ -1366,9 +1405,12 @@ class DownloadManager:
         self,
         max_parallel: int,
         event_callback: Callable[[str, str], None] | None = None,
+        change_callback: Callable[[], None] | None = None,
     ) -> None:
         self._max_parallel = max_parallel
         self._event_callback = event_callback
+        # Called (outside the lock) whenever the set of finished jobs or their files changes.
+        self._change_callback = change_callback
         self._jobs: dict[int, DownloadJob] = {}
         self._queued_job_ids: deque[int] = deque()
         self._lock = threading.RLock()
@@ -1419,6 +1461,76 @@ class DownloadManager:
         self._emit("info", f"Queued job #{job_id}: {label}")
         return self.snapshot_job(job_id)
 
+    def restore_completed(self, **fields: Any) -> DownloadJobSnapshot:
+        """Re-adds a download finished in an earlier session (see comet.library)."""
+        with self._condition:
+            job_id = self._next_job_id
+            self._next_job_id += 1
+            output_dir = fields.pop("output_dir")
+            self._jobs[job_id] = DownloadJob(
+                job_id=job_id,
+                host="",
+                output_dir=output_dir,
+                staging_dir=build_staging_dir(output_dir, job_id),
+                status="completed",
+                phase="Completed",
+                **fields,
+            )
+            return self._make_snapshot(self._jobs[job_id])
+
+    def map_completed(self, describe: Callable[[DownloadJob], Any]) -> list[Any]:
+        """[describe] applied to every finished job, under the lock so each one is consistent."""
+        with self._lock:
+            return [describe(job) for job in self._jobs.values() if job.status == "completed"]
+
+    def job_for_file(self, path: Path) -> DownloadJob | None:
+        """The finished job a downloaded file belongs to."""
+        with self._lock:
+            for job in self._jobs.values():
+                if job.status == "completed" and path in job.destinations:
+                    return job
+        return None
+
+    def record_subtitle(self, job: DownloadJob, path: Path, file_id: int, language: str) -> None:
+        """Notes a subtitle that was fetched by hand for one of the job's videos."""
+        with self._lock:
+            if path not in job.destinations:
+                job.destinations.append(path)
+            job.subtitle_files[file_id] = path
+            job.subtitle_file_ids = sorted(set(job.subtitle_file_ids) | {file_id})
+            if job.subtitle_status not in {"found", "partial", "searching"}:
+                job.subtitle_status = "found"
+                job.subtitle_message = f"{subtitle_language_name(language)} subtitles"
+        self._changed()
+
+    def drop_files(self, job_id: int, paths: list[Path]) -> bool:
+        """Forgets some files of a finished job (they are being deleted). Returns whether the
+        job still has a video afterwards."""
+        gone = set(paths)
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status != "completed":
+                return False
+            job.destinations = [path for path in job.destinations if path not in gone]
+            job.subtitle_sidecars = {
+                video: sidecar
+                for video, sidecar in job.subtitle_sidecars.items()
+                if video not in gone and sidecar[0] not in gone
+            }
+            job.subtitle_files = {
+                file_id: path for file_id, path in job.subtitle_files.items() if path not in gone
+            }
+            videos_left = any(path.suffix.lower() in SUBTITLE_VIDEO_EXTENSIONS for path in job.destinations)
+        self._changed()
+        return videos_left
+
+    def _changed(self) -> None:
+        if self._change_callback is not None:
+            try:
+                self._change_callback()
+            except Exception:  # bookkeeping must never take a worker down
+                pass
+
     def _worker_loop(self) -> None:
         while True:
             with self._condition:
@@ -1437,10 +1549,14 @@ class DownloadManager:
                     job.phase = "Cancelled before start"
                     job.finished_at = time.time()
                     continue
+                # Claimed while still holding the lock: a job that is no longer "queued"
+                # can't be cancelled-and-cleared from under this worker.
+                job.status = "resolving"
+                job.phase = "Resolving links"
+                job.started_at = time.time()
 
             reporter = JobReporter(self, job_id)
             try:
-                reporter.set_resolving()
                 staged_destinations = download_selected_stream(
                     job.host,
                     job.candidate,
@@ -1455,36 +1571,130 @@ class DownloadManager:
                     job.staging_dir,
                     job.output_dir,
                 )
-                reporter.set_downloading_subtitles()
-                expected_subtitles = len(build_subtitle_targets(job, destinations))
-                try:
-                    subtitle_destinations = download_subtitles_for_job(job, destinations)
-                except Exception as subtitle_error:
-                    self._emit(
-                        "warning",
-                        f"Subtitle download skipped for job #{job_id}: {subtitle_error}",
-                    )
-                else:
-                    if subtitle_destinations:
-                        destinations.extend(subtitle_destinations)
-                        self._emit(
-                            "success",
-                            f"Saved {len(subtitle_destinations)} subtitle"
-                            f"{'s' if len(subtitle_destinations) != 1 else ''} for job #{job_id}",
-                        )
-                    if len(subtitle_destinations) < expected_subtitles:
-                        self._emit(
-                            "warning",
-                            f"OpenSubtitles returned {len(subtitle_destinations)}/{expected_subtitles} subtitles for job #{job_id}",
-                        )
+            except JobDeferred as deferred:
+                self._park(job, deferred.wait)
+                continue
             except DownloadCancelled:
                 cleanup_download_dir(job.staging_dir)
                 self._mark_cancelled(job_id, "Cancelled")
+                continue
             except Exception as error:
                 cleanup_download_dir(job.staging_dir)
-                self._mark_failed(job_id, str(error))
-            else:
-                self._mark_completed(job_id, destinations)
+                self._mark_failed(job_id, str(error).strip() or error.__class__.__name__)
+                continue
+
+            # The files are saved from here on: a problem in the subtitle step is reported
+            # on the job but must not turn a finished download into a failed one.
+            try:
+                self.update_job(job_id, embedded_subtitles=embedded_subtitle_summary(destinations))
+                if job.subtitles.is_configured:
+                    reporter.set_downloading_subtitles()
+                    result = self._run_subtitles(job, destinations, job.subtitles)
+                    destinations.extend(path for path in result.paths if path not in destinations)
+                else:
+                    self.update_job(job_id, subtitle_status="off", subtitle_message="")
+            except Exception as error:
+                self.update_job(
+                    job_id, subtitle_status="failed", subtitle_message=f"Subtitle error: {error.__class__.__name__}"
+                )
+            self._mark_completed(job_id, destinations)
+
+    def _park(self, job: DownloadJob, wait: Callable[[], None]) -> None:
+        """Waits for a deferred job on its own thread and re-queues it (first in line) when
+        it is ready. The job stays "resolving" meanwhile, so it can be cancelled as usual."""
+
+        def run() -> None:
+            try:
+                wait()
+            except DownloadCancelled:
+                cleanup_download_dir(job.staging_dir)
+                self._mark_cancelled(job.job_id, "Cancelled")
+                return
+            except Exception as error:
+                cleanup_download_dir(job.staging_dir)
+                self._mark_failed(job.job_id, str(error).strip() or error.__class__.__name__)
+                return
+            with self._condition:
+                if not job.cancel_requested and self._accepting:
+                    job.status = "queued"
+                    job.phase = "Queued"
+                    self._queued_job_ids.appendleft(job.job_id)
+                    self._condition.notify()
+                    return
+            self._mark_cancelled(job.job_id, "Cancelled")
+
+        threading.Thread(target=run, name=f"download-wait-{job.job_id}", daemon=True).start()
+
+    def _run_subtitles(
+        self,
+        job: DownloadJob,
+        video_paths: list[Path],
+        config: OpenSubtitlesConfig,
+        *,
+        manual: bool = False,
+        exclude: set[int] | None = None,
+        keep: dict[Path, str] | None = None,
+    ) -> "SubtitleResult":
+        result = download_subtitles_for_job(
+            job, video_paths, config=config, honour_embedded=not manual, exclude=exclude or set(), keep=keep or {}
+        )
+        with self._lock:
+            job.subtitle_status = result.status
+            job.subtitle_message = result.message
+            for video, path, language in zip(result.videos, result.paths, result.languages):
+                previous = job.subtitle_sidecars.get(video)
+                if previous is not None and previous[0] != path:
+                    result.replaced.append(previous[0])
+                job.subtitle_sidecars[video] = (path, language)
+            job.subtitle_files.update(zip(result.file_ids, result.paths))
+            job.subtitle_file_ids = sorted(set(job.subtitle_file_ids) | set(result.file_ids))
+        level = {"found": "success", "partial": "warning"}.get(result.status, "info")
+        self._emit(level, f"Subtitles for job #{job.job_id}: {result.message}")
+        return result
+
+    def refetch_subtitles(self, job_id: int, config: OpenSubtitlesConfig, try_another: bool) -> bool:
+        """Re-runs the subtitle lookup for a finished job in the background. With
+        [try_another], subtitles picked before are skipped and the old sidecars replaced."""
+        with self._lock:
+            job = self._jobs.get(job_id)
+            if job is None or job.status != "completed" or job.subtitle_status == "searching":
+                return False
+            job.subtitle_status = "searching"
+            job.subtitle_message = "Looking for subtitles…"
+            exclude = set(job.subtitle_file_ids) if try_another else set()
+            # Sidecars that stay in place for videos where nothing else turns up.
+            keep = (
+                {video: language for video, (path, language) in job.subtitle_sidecars.items() if path.exists()}
+                if try_another
+                else {}
+            )
+            videos = [path for path in job.destinations if path.suffix.lower() in SUBTITLE_VIDEO_EXTENSIONS]
+
+        def fail(message: str) -> None:
+            with self._lock:  # the job may have been cleared meanwhile; its object is still ours
+                job.subtitle_status = "failed"
+                job.subtitle_message = message
+
+        def work() -> None:
+            try:
+                present = [path for path in videos if path.exists()]
+                if not present:
+                    fail("The video file was moved or deleted")
+                    return
+                result = self._run_subtitles(job, present, config, manual=True, exclude=exclude, keep=keep)
+                # An old sidecar only goes once the same video has its replacement.
+                replaced = result.replaced if try_another else []
+                for path in replaced:
+                    path.unlink(missing_ok=True)
+                with self._lock:
+                    job.destinations = [path for path in job.destinations if path not in replaced]
+                    job.destinations.extend(path for path in result.paths if path not in job.destinations)
+            except Exception as error:  # never leave the card stuck on "searching"
+                fail(f"Subtitle error: {error.__class__.__name__}")
+            self._changed()
+
+        threading.Thread(target=work, name=f"subtitles-{job_id}", daemon=True).start()
+        return True
 
     def update_job(self, job_id: int, **changes: Any) -> None:
         with self._lock:
@@ -1525,24 +1735,34 @@ class DownloadManager:
                 job.status = "cancelled"
                 job.phase = "Cancelled"
                 job.finished_at = time.time()
-                self._emit("warning", f"Cancelled queued job #{job_id}: {job.label}")
+                message = f"Cancelled queued job #{job_id}: {job.label}"
             else:
-                self._emit("warning", f"Cancelling active job #{job_id}: {job.label}")
+                message = f"Cancelling active job #{job_id}: {job.label}"
             self._condition.notify_all()
+        # Emitted after the lock is released: the terminal UI redraws on every event and its
+        # refresh thread takes this lock for a snapshot, which could deadlock the two.
+        self._emit("warning", message)
         return True
 
-    def clear_finished(self) -> int:
+    def remove(self, job_id: int) -> bool:
         with self._condition:
-            finished_ids = [
-                job_id
-                for job_id, job in self._jobs.items()
-                if job.status in {"completed", "failed", "cancelled"}
-            ]
+            job = self._jobs.get(job_id)
+            if job is None or job.status not in {"completed", "failed", "cancelled"}:
+                return False
+            self._jobs.pop(job_id, None)
+        self._changed()
+        return True
+
+    def clear_finished(self, statuses: tuple[str, ...] = ("completed", "failed", "cancelled")) -> int:
+        with self._condition:
+            finished_ids = [job_id for job_id, job in self._jobs.items() if job.status in statuses]
             for job_id in finished_ids:
                 self._jobs.pop(job_id, None)
-            return len(finished_ids)
+        self._changed()
+        return len(finished_ids)
 
     def shutdown(self) -> list[DownloadJobSnapshot]:
+        messages: list[str] = []
         with self._condition:
             self._accepting = False
             for job_id in list(self._queued_job_ids):
@@ -1553,7 +1773,7 @@ class DownloadManager:
                 job.status = "cancelled"
                 job.phase = "Cancelled during shutdown"
                 job.finished_at = time.time()
-                self._emit("warning", f"Cancelled queued job #{job_id}: {job.label}")
+                messages.append(f"Cancelled queued job #{job_id}: {job.label}")
             self._queued_job_ids.clear()
 
             for job in self._jobs.values():
@@ -1563,6 +1783,8 @@ class DownloadManager:
 
             self._condition.notify_all()
 
+        for message in messages:
+            self._emit("warning", message)
         for worker in self._workers:
             worker.join()
 
@@ -1600,6 +1822,14 @@ class DownloadManager:
             error_text=job.error_text,
             cancel_requested=job.cancel_requested,
             output_dir=job.output_dir,
+            subtitle_status=job.subtitle_status,
+            subtitle_message=job.subtitle_message,
+            embedded_subtitles=tuple(job.embedded_subtitles),
+            media_type=job.media.media_type,
+            imdb_id=job.media.imdb_id,
+            season=job.season,
+            episode=job.episode,
+            title=job.media.title,
         )
 
     def _mark_completed(self, job_id: int, destinations: list[Path]) -> None:
@@ -1617,6 +1847,7 @@ class DownloadManager:
             job.total_bytes = None
             outputs = [str(path) for path in job.destinations]
             label = job.label
+        self._changed()
         self._emit("success", f"Completed job #{job_id}: {label}")
         if outputs:
             self._emit("success", "Saved: " + ", ".join(outputs[:2]))
@@ -1645,7 +1876,11 @@ class DownloadManager:
         self._emit("warning", f"Job #{job_id} cancelled: {label}")
 
     def _emit(self, level: str, message: str) -> None:
-        write_cli_log(level, message)
+        # Logging is best effort: a full disk or read-only log dir must not kill a worker.
+        try:
+            write_cli_log(level, message)
+        except OSError:
+            pass
         if self._event_callback is not None:
             self._event_callback(level, message)
 
@@ -1849,12 +2084,13 @@ def load_opensubtitles_config() -> OpenSubtitlesConfig:
     api_key = configured_env_value(env_values, OPENSUBTITLES_API_KEY_ENV_KEY)
     username = configured_env_value(env_values, OPENSUBTITLES_USERNAME_ENV_KEY)
     password = configured_env_value(env_values, OPENSUBTITLES_PASSWORD_ENV_KEY)
+    languages = parse_subtitle_languages(env_values.get(OPENSUBTITLES_LANGUAGES_ENV_KEY))
 
     if api_key and username and password:
-        return OpenSubtitlesConfig(api_key=api_key, username=username, password=password)
+        return OpenSubtitlesConfig(api_key=api_key, username=username, password=password, languages=languages)
 
     if not sys.stdin.isatty():
-        return OpenSubtitlesConfig(api_key=api_key, username=username, password=password)
+        return OpenSubtitlesConfig(api_key=api_key, username=username, password=password, languages=languages)
 
     UI.info("OpenSubtitles API key, username, and password are required for subtitle downloads.")
     if not api_key:
@@ -1869,7 +2105,7 @@ def load_opensubtitles_config() -> OpenSubtitlesConfig:
         upsert_env_value(ENV_PATH, OPENSUBTITLES_USERNAME_ENV_KEY, username)
         upsert_env_value(ENV_PATH, OPENSUBTITLES_PASSWORD_ENV_KEY, password)
 
-    return OpenSubtitlesConfig(api_key=api_key, username=username, password=password)
+    return OpenSubtitlesConfig(api_key=api_key, username=username, password=password, languages=languages)
 
 
 def resolve_output_dir(cli_output_dir: str | None) -> tuple[Path, bool]:
@@ -2310,27 +2546,31 @@ def build_stream_candidates(
     return results
 
 
-def group_top_streams(candidates: list[StreamCandidate]) -> list[StreamCandidate]:
+def group_top_streams(candidates: list[StreamCandidate], limit: int = STREAM_RESULT_LIMIT) -> list[StreamCandidate]:
     grouped: list[StreamCandidate] = []
     for resolution in ("4K", "1080P"):
         resolution_candidates = [item for item in candidates if item.resolution == resolution]
         strict_matches = [item for item in resolution_candidates if item.is_strict_match]
         fallback_matches = [item for item in resolution_candidates if not item.is_strict_match]
-        strict_matches.sort(key=lambda item: (not item.is_cached, not item.has_subtitle_hint, item.index))
+        # The "subs" hint is only a regex on the title, so it no longer affects order.
+        strict_matches.sort(key=lambda item: item.index)
         fallback_matches.sort(
             key=lambda item: (
                 item.preferred_distance_bytes,
-                not item.is_cached,
-                not item.has_subtitle_hint,
                 item.size_bytes,
                 item.index,
             )
         )
 
-        selected = strict_matches[:STREAM_RESULT_LIMIT]
-        remaining = STREAM_RESULT_LIMIT - len(selected)
-        if remaining > 0:
-            selected.extend(fallback_matches[:remaining])
+        # Cached streams download right away, so they beat uncached ones even when their
+        # size is outside the preferred range; within each group, in-range comes first.
+        ordered = (
+            [item for item in strict_matches if item.is_cached]
+            + [item for item in fallback_matches if item.is_cached]
+            + [item for item in strict_matches if not item.is_cached]
+            + [item for item in fallback_matches if not item.is_cached]
+        )
+        selected = ordered[:limit]
         grouped.extend(selected)
 
     for new_index, candidate in enumerate(grouped, start=1):
@@ -2363,8 +2603,8 @@ def choose_stream(candidates: list[StreamCandidate]) -> StreamCandidate:
 
 
 def sanitize_filename(value: str) -> str:
-    cleaned = SAFE_FILENAME_CHARS.sub(" ", value).strip().rstrip(".")
-    cleaned = re.sub(r"\s+", " ", cleaned)
+    cleaned = SAFE_FILENAME_CHARS.sub(" ", unicodedata.normalize("NFC", value)).strip().rstrip(".")
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
     return cleaned or "download.bin"
 
 
@@ -2430,10 +2670,20 @@ def build_staging_dir(output_dir: Path, job_id: int) -> Path:
 
 
 def extract_filename(headers, fallback_name: str, fallback_ext: str = ".mkv") -> str:
-    header = headers.get("Content-Disposition", "")
+    header = headers.get("Content-Disposition", "") or ""
     match = CONTENT_DISPOSITION_FILENAME.search(header)
     if match:
-        filename = os.path.basename(match.group(1).strip().strip('"'))
+        raw_name = match.group(2).strip().strip('"')
+        if match.group(1):
+            # filename*=UTF-8''percent-encoded (RFC 5987)
+            raw_name = unquote(raw_name)
+        else:
+            # http.client decodes headers as Latin-1; servers usually send raw UTF-8.
+            try:
+                raw_name = raw_name.encode("latin-1").decode("utf-8")
+            except UnicodeError:
+                pass
+        filename = os.path.basename(raw_name.replace("\\", "/"))
         if filename and not looks_generic_filename(filename):
             return sanitize_filename(filename)
 
@@ -2461,6 +2711,9 @@ def cleanup_download_dir(path: Path) -> None:
     path.unlink(missing_ok=True)
 
 
+_FINALIZE_LOCK = threading.Lock()
+
+
 def finalize_downloaded_files(
     staged_paths: list[Path],
     staging_dir: Path,
@@ -2468,12 +2721,74 @@ def finalize_downloaded_files(
 ) -> list[Path]:
     output_dir.mkdir(parents=True, exist_ok=True)
     finalized_paths: list[Path] = []
-    for staged_path in staged_paths:
-        destination, _ = reserve_destination_path(output_dir, staged_path.name)
-        shutil.move(str(staged_path), str(destination))
-        finalized_paths.append(destination)
+    # Two jobs finishing the same file at once must not pick the same free name.
+    with _FINALIZE_LOCK:
+        for staged_path in staged_paths:
+            destination, _ = reserve_destination_path(output_dir, staged_path.name)
+            shutil.move(str(staged_path), str(destination))
+            finalized_paths.append(destination)
     cleanup_download_dir(staging_dir)
     return finalized_paths
+
+
+DOWNLOAD_MAX_RETRIES = 6
+DOWNLOAD_READ_TIMEOUT = 120
+DOWNLOAD_CHUNK_SIZE = 1024 * 1024
+
+
+def _open_download(download_url: str, start: int = 0):
+    headers = {"User-Agent": "Mozilla/5.0"}
+    if start > 0:
+        headers["Range"] = f"bytes={start}-"
+    return urlopen(Request(download_url, headers=headers), timeout=DOWNLOAD_READ_TIMEOUT)
+
+
+def _wait_or_cancel(seconds: float, cancel_event: threading.Event | None) -> None:
+    if cancel_event is None:
+        time.sleep(seconds)
+        return
+    if cancel_event.wait(seconds):
+        raise DownloadCancelled()
+
+
+def _write_error(error: OSError) -> RuntimeError:
+    if error.errno in (errno.ENOSPC, errno.EDQUOT):
+        return RuntimeError("Not enough free space on the device to finish this download.")
+    return RuntimeError(f"Could not write the file: {error.strerror or error.__class__.__name__}")
+
+
+def _open_download_with_retry(
+    download_url: str,
+    reporter: "JobReporter | None",
+    cancel_event: threading.Event | None,
+):
+    """First connection for a file. Network hiccups and 5xx/429 answers are retried with
+    the same backoff as a dropped transfer, so one blip between two files of a season
+    pack doesn't throw the whole job away."""
+    attempt = 0
+    while True:
+        try:
+            return _open_download(download_url)
+        except HTTPError as error:
+            body = error.read().decode("utf-8", errors="replace").strip()
+            detail = body[:200] if body else error.reason
+            failure = RuntimeError(f"Download server returned HTTP {error.code}: {detail}")
+            if error.code < 500 and error.code != 429:
+                raise failure from error
+        except (URLError, OSError, http.client.HTTPException) as error:
+            reason = getattr(error, "reason", None) or str(error) or error.__class__.__name__
+            failure = RuntimeError(f"Download server request failed: {reason}")
+        attempt += 1
+        if attempt > DOWNLOAD_MAX_RETRIES:
+            raise failure
+        if reporter is not None:
+            reporter.update_job_phase(f"Reconnecting ({attempt}/{DOWNLOAD_MAX_RETRIES})")
+        _wait_or_cancel(min(2 ** attempt, 30), cancel_event)
+
+
+def _content_range_start(headers) -> int | None:
+    match = re.match(r"bytes\s+(\d+)-", headers.get("Content-Range", "") or "")
+    return int(match.group(1)) if match else None
 
 
 def download_from_url_with_progress(
@@ -2486,60 +2801,124 @@ def download_from_url_with_progress(
     completed_files: int = 0,
     total_files: int = 1,
 ) -> Path:
+    """Streams a file to disk, resuming with Range requests when the connection drops.
+
+    A download only counts as done when the byte count matches Content-Length, so a
+    truncated transfer is retried (or fails) instead of being saved as a broken file.
+    """
     output_dir.mkdir(parents=True, exist_ok=True)
     if cancel_event is not None and cancel_event.is_set():
         raise DownloadCancelled()
 
-    request = Request(download_url, headers={"User-Agent": "Mozilla/5.0"})
+    download_response = _open_download_with_retry(download_url, reporter, cancel_event)
+
+    filename = extract_filename(download_response.headers, fallback_name)
+    destination, temp_destination = reserve_destination_path(output_dir, filename)
+    total_header = download_response.headers.get("Content-Length")
+    total_bytes_int = int(total_header) if total_header and total_header.isdigit() else None
+    downloaded_bytes = 0
+    started_at = time.time()
+    resumed_from = 0
+    retries = 0
+    if reporter is not None:
+        reporter.start_file(completed_files + 1, total_files, filename, total_bytes_int)
+
+    response = download_response
     try:
-        download_response = urlopen(request, timeout=300)
-    except HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace").strip()
-        detail = body[:200] if body else error.reason
-        raise RuntimeError(f"Download server returned HTTP {error.code}: {detail}") from error
-    except URLError as error:
-        raise RuntimeError(f"Download server request failed: {error.reason}") from error
-
-    with download_response:
-        filename = extract_filename(download_response.headers, fallback_name)
-        destination, temp_destination = reserve_destination_path(output_dir, filename)
-        total_bytes = download_response.headers.get("Content-Length")
-        total_bytes_int = int(total_bytes) if total_bytes and total_bytes.isdigit() else None
-        downloaded_bytes = 0
-        started_at = time.time()
-        if reporter is not None:
-            reporter.start_file(completed_files + 1, total_files, filename, total_bytes_int)
-
         try:
-            with temp_destination.open("wb") as file_handle:
-                while True:
-                    if cancel_event is not None and cancel_event.is_set():
-                        raise DownloadCancelled()
-                    if reporter is not None:
-                        reporter.ensure_not_cancelled()
+            file_handle = temp_destination.open("wb")
+        except OSError as error:
+            response.close()
+            raise _write_error(error) from None
+        with file_handle:
+            while True:
+                failure: str | None = None
+                try:
+                    while True:
+                        if cancel_event is not None and cancel_event.is_set():
+                            raise DownloadCancelled()
+                        if reporter is not None:
+                            reporter.ensure_not_cancelled()
+                        chunk = response.read(DOWNLOAD_CHUNK_SIZE)
+                        if not chunk:
+                            break
+                        try:
+                            file_handle.write(chunk)
+                        except OSError as error:
+                            # Disk full or storage gone: retrying the connection can't help.
+                            raise _write_error(error) from None
+                        downloaded_bytes += len(chunk)
+                        retries = 0
+                        elapsed = max(time.time() - started_at, 1e-6)
+                        if reporter is not None:
+                            reporter.update_progress(
+                                downloaded_bytes=downloaded_bytes,
+                                total_bytes=total_bytes_int,
+                                speed=(downloaded_bytes - resumed_from) / elapsed,
+                                completed_files=completed_files,
+                                total_files=total_files,
+                            )
+                except (OSError, http.client.HTTPException) as error:
+                    failure = f"connection lost ({error.__class__.__name__})"
+                finally:
+                    response.close()
 
-                    chunk = download_response.read(1024 * 1024)
-                    if not chunk:
+                if failure is None:
+                    if total_bytes_int is None or downloaded_bytes >= total_bytes_int:
                         break
-                    file_handle.write(chunk)
-                    downloaded_bytes += len(chunk)
+                    failure = "connection closed early"
 
-                    elapsed = max(time.time() - started_at, 1e-6)
-                    speed = downloaded_bytes / elapsed
-                    if reporter is not None:
-                        reporter.update_progress(
-                            downloaded_bytes=downloaded_bytes,
-                            total_bytes=total_bytes_int,
-                            speed=speed,
-                            completed_files=completed_files,
-                            total_files=total_files,
-                        )
-            os.replace(temp_destination, destination)
-        except Exception:
-            temp_destination.unlink(missing_ok=True)
-            raise
+                retries += 1
+                if retries > DOWNLOAD_MAX_RETRIES:
+                    got = format_bytes(downloaded_bytes)
+                    want = format_bytes(total_bytes_int) if total_bytes_int else "?"
+                    raise RuntimeError(
+                        f"Download kept failing ({failure}); got {got} of {want}."
+                    )
+                if reporter is not None:
+                    reporter.update_job_phase(f"Reconnecting ({retries}/{DOWNLOAD_MAX_RETRIES})")
+                _wait_or_cancel(min(2 ** retries, 30), cancel_event)
+
+                try:
+                    response = _open_download(download_url, downloaded_bytes)
+                except HTTPError as error:
+                    if error.code == 416 and total_bytes_int is not None and downloaded_bytes >= total_bytes_int:
+                        break
+                    response = None
+                except (URLError, OSError, http.client.HTTPException):
+                    response = None
+                if response is None:
+                    response = _ClosedResponse()
+                    continue
+
+                if response.status == 206 and _content_range_start(response.headers) == downloaded_bytes:
+                    pass
+                else:
+                    # Server ignored the Range header: start over from the beginning.
+                    file_handle.seek(0)
+                    file_handle.truncate()
+                    downloaded_bytes = 0
+                    length = response.headers.get("Content-Length")
+                    if length and length.isdigit():
+                        total_bytes_int = int(length)
+                resumed_from = downloaded_bytes
+                started_at = time.time()
+        os.replace(temp_destination, destination)
+    except BaseException:
+        temp_destination.unlink(missing_ok=True)
+        raise
 
     return destination
+
+
+class _ClosedResponse:
+    """Stand-in for a failed reconnect, so the retry loop counts it and tries again."""
+
+    def read(self, _size: int = -1) -> bytes:
+        raise ConnectionError("reconnect failed")
+
+    def close(self) -> None:
+        pass
 
 
 def build_file_fallback_name(file_name: str, default_name: str) -> str:
@@ -2643,275 +3022,182 @@ def download_selected_stream(
     )
 
 
-def opensubtitles_headers(
-    config: OpenSubtitlesConfig,
-    token: str | None = None,
-    *,
-    content_type: bool = False,
-) -> dict[str, str]:
-    headers = {
-        "Accept": "application/json",
-        "Api-Key": config.api_key,
-        "User-Agent": OPENSUBTITLES_USER_AGENT,
-    }
-    if content_type:
-        headers["Content-Type"] = "application/json"
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
-
-
-def normalize_opensubtitles_base_url(value: str) -> str:
-    value = value.strip()
-    if not value:
-        return OPENSUBTITLES_DEFAULT_BASE_URL
-    if not value.startswith(("http://", "https://")):
-        value = f"https://{value}"
-    value = value.rstrip("/")
-    if value.endswith("/api/v1"):
-        return value
-    return value + "/api/v1"
-
-
-def opensubtitles_login(config: OpenSubtitlesConfig) -> tuple[str, str]:
-    cache_key = (config.api_key, config.username, config.password)
-    with OPENSUBTITLES_SESSION_LOCK:
-        cached = OPENSUBTITLES_SESSION_CACHE.get(cache_key)
-        if cached is not None:
-            return cached
-
-        payload = http_post_json(
-            f"{OPENSUBTITLES_DEFAULT_BASE_URL}/login",
-            {"username": config.username, "password": config.password},
-            headers=opensubtitles_headers(config, content_type=True),
-            timeout=30,
-        )
-        token = str(payload.get("token", "")).strip()
-        if not token:
-            raise RuntimeError("OpenSubtitles login did not return a bearer token.")
-        session = (token, normalize_opensubtitles_base_url(str(payload.get("base_url", ""))))
-        OPENSUBTITLES_SESSION_CACHE[cache_key] = session
-        return session
-
-
-def imdb_id_number(imdb_id: str) -> str:
-    return imdb_id[2:] if imdb_id.startswith("tt") else imdb_id
-
-
-def opensubtitles_moviehash(video_path: Path) -> str | None:
-    size = video_path.stat().st_size
-    chunk_size = 64 * 1024
-    if size < chunk_size * 2:
-        return None
-
-    checksum = size
-    with video_path.open("rb") as file_handle:
-        for _ in range(chunk_size // 8):
-            chunk = file_handle.read(8)
-            if len(chunk) != 8:
-                return None
-            checksum = (checksum + int.from_bytes(chunk, "little", signed=False)) & 0xFFFFFFFFFFFFFFFF
-
-        file_handle.seek(max(size - chunk_size, 0))
-        for _ in range(chunk_size // 8):
-            chunk = file_handle.read(8)
-            if len(chunk) != 8:
-                return None
-            checksum = (checksum + int.from_bytes(chunk, "little", signed=False)) & 0xFFFFFFFFFFFFFFFF
-
-    return f"{checksum:016x}"
-
-
-def subtitle_rank(item: dict[str, Any]) -> tuple[float, int, int, int]:
-    attributes = item.get("attributes") or {}
-    ratings = float(attributes.get("ratings") or 0)
-    votes = int(attributes.get("votes") or 0)
-    points = int(attributes.get("points") or 0)
-    downloads = int(attributes.get("download_count") or attributes.get("new_download_count") or 0)
-    return ratings, votes, points, downloads
-
-
-def select_best_subtitle_file(search_payload: dict[str, Any]) -> int | None:
-    rows = [item for item in search_payload.get("data", []) if isinstance(item, dict)]
-    rows.sort(key=subtitle_rank, reverse=True)
-    for row in rows:
-        attributes = row.get("attributes") or {}
-        if attributes.get("foreign_parts_only") is True:
-            continue
-        files = attributes.get("files") or []
-        for file_info in files:
-            if not isinstance(file_info, dict):
-                continue
-            file_id = file_info.get("file_id")
-            try:
-                return int(file_id)
-            except (TypeError, ValueError):
-                continue
-    return None
-
-
-def find_best_english_subtitle_file_id(
-    config: OpenSubtitlesConfig,
-    token: str,
-    base_url: str,
-    *,
-    imdb_id: str,
-    video_path: Path,
-    season: int | None = None,
-    episode: int | None = None,
-) -> int | None:
-    base_params = {
-        "imdb_id": imdb_id_number(imdb_id),
-        "languages": "en",
-        "order_by": "ratings",
-        "order_direction": "desc",
-    }
-    if season is not None:
-        base_params["season_number"] = str(season)
-    if episode is not None:
-        base_params["episode_number"] = str(episode)
-
-    moviehash = opensubtitles_moviehash(video_path)
-    if moviehash is not None:
-        hash_params = {
-            "moviehash": moviehash,
-            "moviebytesize": str(video_path.stat().st_size),
-            "languages": "en",
-            "order_by": "ratings",
-            "order_direction": "desc",
-        }
-        url = f"{base_url}/subtitles?{urlencode(hash_params)}"
-        payload = http_json(url, headers=opensubtitles_headers(config, token), timeout=30)
-        file_id = select_best_subtitle_file(payload)
-        if file_id is not None:
-            return file_id
-
-    url = f"{base_url}/subtitles?{urlencode(base_params)}"
-    payload = http_json(url, headers=opensubtitles_headers(config, token), timeout=30)
-    return select_best_subtitle_file(payload)
-
-
-def subtitle_bytes_from_download(raw: bytes, content_type: str, source_url: str) -> bytes:
-    lower_url = urlparse(source_url).path.lower()
-    if "gzip" in content_type.lower() or lower_url.endswith(".gz"):
-        return gzip.decompress(raw)
-    if "zip" in content_type.lower() or lower_url.endswith(".zip"):
-        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-            subtitle_names = [
-                name for name in archive.namelist() if name.lower().endswith((".srt", ".vtt", ".sub"))
-            ]
-            if not subtitle_names:
-                raise RuntimeError("OpenSubtitles archive did not contain a subtitle file.")
-            with archive.open(subtitle_names[0]) as file_handle:
-                return file_handle.read()
-    return raw
-
-
-def write_subtitle_sidecar(video_path: Path, subtitle_bytes: bytes) -> Path:
-    destination = video_path.with_suffix(".en.srt")
-    suffix = 1
-    while destination.exists():
-        destination = video_path.with_name(f"{video_path.stem}.en ({suffix}).srt")
-        suffix += 1
-    destination.write_bytes(subtitle_bytes)
-    return destination
-
-
-def download_opensubtitle_file(
-    config: OpenSubtitlesConfig,
-    token: str,
-    base_url: str,
-    file_id: int,
-    video_path: Path,
-) -> Path:
-    payload = http_post_json(
-        f"{base_url}/download",
-        {"file_id": file_id, "sub_format": "srt"},
-        headers=opensubtitles_headers(config, token, content_type=True),
-        timeout=30,
-    )
-    link = str(payload.get("link", "")).strip()
-    if not link:
-        raise RuntimeError("OpenSubtitles download response did not include a link.")
-
-    request = Request(link, headers={"User-Agent": OPENSUBTITLES_USER_AGENT})
-    try:
-        with urlopen(request, timeout=60) as response:
-            raw = response.read()
-            content_type = response.headers.get("Content-Type", "")
-    except HTTPError as error:
-        body = error.read().decode("utf-8", errors="replace").strip()
-        detail = body[:200] if body else error.reason
-        raise RuntimeError(f"OpenSubtitles file download returned HTTP {error.code}: {detail}") from error
-    except URLError as error:
-        raise RuntimeError(f"OpenSubtitles file download failed: {error.reason}") from error
-
-    return write_subtitle_sidecar(video_path, subtitle_bytes_from_download(raw, content_type, link))
-
-
-def episode_number_from_filename(path: Path) -> int | None:
-    filename = path.name
-    for pattern in (
-        r"\bS\d{1,2}E(\d{1,3})\b",
-        r"\b\d{1,2}x(\d{1,3})\b",
-        r"\b(?:E|EP|Episode)[ ._-]*(\d{1,3})\b",
-    ):
-        match = re.search(pattern, filename, re.IGNORECASE)
-        if match:
-            try:
-                return int(match.group(1))
-            except ValueError:
-                return None
-    return None
-
-
 def build_subtitle_targets(job: DownloadJob, video_paths: list[Path]) -> list[tuple[Path, int | None, int | None]]:
+    """Video files that need a subtitle, with the episode each one is. Files whose episode
+    can't be read from the name are left out rather than guessed from their position."""
+    videos = [
+        path for path in video_paths
+        if path.suffix.lower() in SUBTITLE_VIDEO_EXTENSIONS and "sample" not in path.name.lower()
+    ]
+    if not videos:
+        return []
     if job.media.media_type == "movie":
-        return [(path, None, None) for path in video_paths]
-    if job.episode is not None:
-        return [(path, job.season, job.episode) for path in video_paths]
+        # Only the main feature: extras would just burn download quota.
+        return [(max(videos, key=lambda path: path.stat().st_size), None, None)]
+    if job.episode is not None and len(videos) == 1:
+        return [(videos[0], job.season, job.episode)]
 
     targets: list[tuple[Path, int | None, int | None]] = []
-    for index, path in enumerate(video_paths, start=1):
-        episode = episode_number_from_filename(path) or index
-        targets.append((path, job.season, episode))
+    for path in videos:
+        season, episode = season_episode_from_filename(path)
+        if episode is None:
+            episode = episode_number_from_filename(path)
+        if episode is None:
+            continue
+        if job.episode is not None and episode != job.episode:
+            continue
+        targets.append((path, season or job.season, episode))
     return targets
 
 
-def download_subtitles_for_job(job: DownloadJob, video_paths: list[Path]) -> list[Path]:
-    if not job.subtitles.is_configured:
-        raise RuntimeError(
-            "OpenSubtitles is not configured. Set OPENSUBTITLES_API_KEY, "
-            "OPENSUBTITLES_USERNAME, and OPENSUBTITLES_PASSWORD."
-        )
+@dataclass
+class SubtitleResult:
+    status: str  # found | partial | missing | failed
+    message: str
+    paths: list[Path] = field(default_factory=list)
+    file_ids: list[int] = field(default_factory=list)
+    # Parallel to [paths]: the video each sidecar belongs to and its language code.
+    videos: list[Path] = field(default_factory=list)
+    languages: list[str] = field(default_factory=list)
+    # Older sidecars that the new ones supersede (filled in by the download manager).
+    replaced: list[Path] = field(default_factory=list)
 
-    token, base_url = opensubtitles_login(job.subtitles)
-    subtitle_paths: list[Path] = []
-    failures: list[str] = []
-    for video_path, season, episode in build_subtitle_targets(job, video_paths):
-        label = f"S{season:02d}E{episode:02d}" if season and episode else job.media.title
+
+def _language_list(languages: tuple[str, ...]) -> str:
+    names = [subtitle_language_name(code) for code in languages]
+    return names[0] if len(names) == 1 else ", ".join(names[:-1]) + " or " + names[-1]
+
+
+def download_subtitles_for_job(
+    job: DownloadJob,
+    video_paths: list[Path],
+    *,
+    config: OpenSubtitlesConfig | None = None,
+    honour_embedded: bool = True,
+    exclude: set[int] | None = None,
+    keep: dict[Path, str] | None = None,
+) -> SubtitleResult:
+    """One subtitle per video, in the first available preferred language. A video that
+    already carries a text track in a preferred language only gets a sidecar in a language
+    ranked above it. [keep] maps videos to the language of a sidecar they already have,
+    which stays (and counts) when nothing else is found for that video.
+    Never raises: problems are reported on the job, the download stands."""
+    config = config or job.subtitles
+    keep = keep or {}
+    if not config.has_login:
+        # Searching works with just the key, but OpenSubtitles refuses downloads without a login.
+        return SubtitleResult("failed", "Add your OpenSubtitles username and password to get subtitles")
+    try:
+        targets = build_subtitle_targets(job, video_paths)
+    except OSError:
+        targets = []
+    if not targets:
+        return SubtitleResult("missing", "No video file to match subtitles to")
+    try:
+        session = OpenSubtitlesSession(config)
+    except Exception as error:  # pragma: no cover - defensive
+        return SubtitleResult("failed", str(error))
+
+    paths: list[Path] = []
+    file_ids: list[int] = []
+    videos: list[Path] = []
+    sidecar_languages: list[str] = []
+    covered_languages: list[str] = []  # language per covered target (sidecar or built in)
+    handled: set[Path] = set()
+    built_in = 0
+    problem = ""
+    for video_path, season, episode in targets:
+        if job.cancel_event.is_set() and honour_embedded:
+            problem = "Stopped"
+            break
+        languages = config.languages
+        embedded_best: str | None = None
+        if honour_embedded:
+            embedded = {t.language for t in mkv_subtitle_tracks(video_path) if t.is_text and not t.forced}
+            ranked_embedded = [code for code in languages if code in embedded]
+            if ranked_embedded:
+                embedded_best = ranked_embedded[0]
+                languages = languages[: languages.index(embedded_best)]
+        if not languages:
+            built_in += 1
+            covered_languages.append(embedded_best or "")
+            handled.add(video_path)
+            continue
         try:
-            file_id = find_best_english_subtitle_file_id(
-                job.subtitles,
-                token,
-                base_url,
+            choice = find_subtitle(
+                session,
+                media_type=job.media.media_type,
                 imdb_id=job.media.imdb_id,
                 video_path=video_path,
                 season=season,
                 episode=episode,
+                languages=languages,
+                exclude=exclude,
             )
-            if file_id is None:
-                failures.append(f"{label}: no English result")
+            if choice is None:
+                if embedded_best:
+                    built_in += 1
+                    covered_languages.append(embedded_best)
+                    handled.add(video_path)
                 continue
-            subtitle_paths.append(
-                download_opensubtitle_file(job.subtitles, token, base_url, file_id, video_path)
-            )
+            paths.append(download_subtitle(session, choice, video_path, overwrite=not honour_embedded))
+            file_ids.append(choice.file_id)
+            videos.append(video_path)
+            sidecar_languages.append(choice.language)
+            covered_languages.append(choice.language)
+            handled.add(video_path)
+        except OpenSubtitlesQuotaError:
+            problem = "Daily OpenSubtitles download limit reached"
+            break
+        except OpenSubtitlesError as error:
+            if error.status == 401 and not session.token:
+                problem = session.login_error or "OpenSubtitles needs you to sign in to download"
+                break
+            if error.status in (401, 403) and not session.login_error:
+                problem = "OpenSubtitles rejected the API key"
+                break
+            problem = str(error)
         except Exception as error:
-            failures.append(f"{label}: {error}")
-            continue
-    if failures and not subtitle_paths:
-        raise RuntimeError("; ".join(failures[:3]))
-    return subtitle_paths
+            problem = f"Subtitle error: {error.__class__.__name__}"
+
+    # Videos that got nothing new keep the sidecar they already had.
+    kept = 0
+    for video_path, _, _ in targets:
+        if video_path not in handled and video_path in keep:
+            kept += 1
+            covered_languages.append(keep[video_path])
+
+    covered = len(covered_languages)
+    if covered:
+        ordered = [code for code in config.languages if code in covered_languages]
+        ordered += sorted({code for code in covered_languages if code and code not in config.languages})
+        names = " + ".join(subtitle_language_name(code) for code in ordered) or "Built-in"
+        if len(targets) == 1:
+            if kept:
+                reason = (
+                    problem
+                    if problem and problem != "Stopped"
+                    else f"No other {_language_list(config.languages)} subtitles found"
+                )
+                message = f"{reason} · kept the current one"
+            else:
+                message = f"{names} subtitles" + (" built into the file" if built_in else "")
+            return SubtitleResult("found", message, paths, file_ids, videos, sidecar_languages)
+        status = "found" if covered == len(targets) else "partial"
+        message = f"{names} subtitles for {covered}/{len(targets)} episodes"
+        notes = ([f"{built_in} built in"] if built_in else []) + ([f"{kept} unchanged"] if kept else [])
+        if notes:
+            message += f" ({', '.join(notes)})"
+        if problem and problem != "Stopped":
+            message += f" · {problem}"
+        return SubtitleResult(status, message, paths, file_ids, videos, sidecar_languages)
+    if problem == "Stopped":
+        return SubtitleResult("missing", "Subtitles skipped")
+    if problem:
+        return SubtitleResult("failed", problem)
+    if exclude:
+        return SubtitleResult("missing", f"No other {_language_list(config.languages)} subtitles found")
+    return SubtitleResult("missing", f"No {_language_list(config.languages)} subtitles found")
 
 
 def emit_ui_event(level: str, message: str) -> None:
@@ -3042,7 +3328,7 @@ def main() -> None:
             f"{'s' if args.parallel_downloads != 1 else ''} at once."
         )
         if subtitles.is_configured:
-            UI.info("OpenSubtitles English subtitle downloads are enabled.")
+            UI.info(f"OpenSubtitles subtitles enabled ({_language_list(subtitles.languages)}, first found wins).")
         else:
             UI.warning(
                 "OpenSubtitles is not configured; set OPENSUBTITLES_API_KEY, "
