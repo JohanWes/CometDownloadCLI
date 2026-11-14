@@ -211,13 +211,32 @@ def _b64decode_json(raw: str) -> dict[str, Any]:
 
 
 def _parse_config(b64config: str) -> tuple[str, str]:
+    """Provider and token of a stream config. Links listed by this app carry no token (see
+    [_fetch_streams_direct]); the token is then empty and comes from Settings instead."""
     payload = _b64decode_json(b64config)
     for entry in payload.get("debridServices", []):
         provider = str(entry.get("service", "")).strip().lower()
         token = str(entry.get("apiKey", "")).strip()
-        if provider in cli.DEBRID_PROVIDERS and token:
+        if provider in cli.DEBRID_PROVIDERS:
             return provider, token
-    raise RuntimeError("Missing supported debrid provider token in stream config.")
+    raise RuntimeError("Missing supported debrid provider in stream config.")
+
+
+def _strip_link_token(playback_url: str) -> str:
+    """[playback_url] without the debrid token older versions put in its config part, so the
+    token is never written to the library file. Links that already have none come back as is."""
+    parts = playback_url.split("/")
+    index = next((i for i, part in enumerate(parts) if part), None)
+    if index is None:
+        return playback_url
+    try:
+        provider, token = _parse_config(parts[index])
+    except Exception:
+        return playback_url
+    if not token:
+        return playback_url
+    parts[index] = cli.build_b64_config(provider, "")
+    return "/".join(parts)
 
 
 def _decode_playback_payload(raw: str) -> dict[str, Any]:
@@ -388,7 +407,9 @@ def _fetch_streams_direct(
     media_type: str,
     media_id: str,
 ) -> list[dict[str, Any]]:
-    b64config = cli.build_b64_config(provider, token)
+    # The links only name the provider. They end up in the library file on the device, so the
+    # token stays out of them and is read from Settings when a download starts (_parse_playback).
+    b64config = cli.build_b64_config(provider, "")
     parts = media_id.split(":")
     imdb_id = parts[0]
     season = int(parts[1]) if len(parts) >= 2 and parts[1].isdigit() else None
@@ -527,11 +548,14 @@ def _parse_playback(playback_url: str) -> tuple[str, str, dict[str, Any]]:
     path = urlparse(playback_url).path or playback_url
     b64config = [part for part in path.split("/") if part][0]
     provider, provider_token = _parse_config(b64config)
-    # The link carries the token it was listed with. A token corrected in Settings since
-    # then must also apply to queued jobs and retries, or they keep failing with the old one.
+    # The link names the provider only; the token is the one in Settings right now, so a token
+    # corrected there also applies to queued jobs and retries.
     current = _api
     if current is not None and current.provider == provider and current.token:
         provider_token = current.token
+    if not provider_token:
+        label = PROVIDER_LABELS.get(provider, provider)
+        raise RuntimeError(f"This was listed with {label}. Select {label} and enter its token in Settings.")
     return provider, provider_token, _decode_playback_payload(token)
 
 
@@ -705,13 +729,23 @@ class AndroidCometApi:
         )
         self._restore_library()
         self._restoring = False
+        if self._library_needs_rewrite:
+            self._save_library()
 
     def _restore_library(self) -> None:
+        self._library_needs_rewrite = False
         if self.library is None:
             return
         for record in self.library.load():
             try:
                 request = record["request"]
+                # Files written before 1.0 kept the debrid token inside the link: drop it and
+                # rewrite the file without it.
+                link = str(request["stream"]["playback_url"])
+                clean_link = _strip_link_token(link)
+                if clean_link != link:
+                    request["stream"]["playback_url"] = clean_link
+                    self._library_needs_rewrite = True
                 media_json = json.dumps(request["media"])
                 stream_json = json.dumps(request["stream"])
                 season, episode = request.get("season"), request.get("episode")
@@ -874,7 +908,11 @@ class AndroidCometApi:
         episode: int | None = None,
     ) -> str:
         media = _media_from_dict(json.loads(media_json))
-        stream = _stream_from_dict(json.loads(stream_json))
+        stream_dict = json.loads(stream_json)
+        # Whatever built the link, the copy kept for retries and the library file has no token.
+        stream_dict["playback_url"] = _strip_link_token(str(stream_dict["playback_url"]))
+        stream_json = json.dumps(stream_dict)
+        stream = _stream_from_dict(stream_dict)
         actual_season = int(season) if season is not None and int(season) > 0 else None
         actual_episode = int(episode) if episode is not None and int(episode) > 0 else None
         preferred_name = cli.build_preferred_filename_base(
