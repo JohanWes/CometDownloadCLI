@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 import argparse
 import base64
+import codecs
 import errno
 import http.client
 import json
@@ -623,6 +624,7 @@ class TerminalUI:
             self.refresh()
             pending_escape = False
             escape_sequence = ""
+            decoder = codecs.getincrementaldecoder("utf-8")("replace")
             while True:
                 ready, _, _ = select.select([fd], [], [], 0.1)
                 if not ready:
@@ -638,8 +640,7 @@ class TerminalUI:
                 if not chunk:
                     continue
 
-                for byte in chunk:
-                    char = chr(byte)
+                for char in decoder.decode(chunk):
                     if pending_escape:
                         escape_sequence += char
                         if not self._handle_live_escape_sequence(escape_sequence):
@@ -696,6 +697,7 @@ class TerminalUI:
 
         buffer = ""
         pending_escape = False
+        decoder = codecs.getincrementaldecoder("utf-8")("replace")
         try:
             while True:
                 ready, _, _ = select.select([fd], [], [], 0.1)
@@ -709,8 +711,7 @@ class TerminalUI:
                 if not chunk:
                     continue
 
-                for byte in chunk:
-                    char = chr(byte)
+                for char in decoder.decode(chunk):
                     if pending_escape:
                         pending_escape = False
                         if char in ("[", "O"):
