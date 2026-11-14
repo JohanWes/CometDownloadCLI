@@ -69,6 +69,11 @@ class PlayerActivity : ComponentActivity() {
         applyOrientation(newConfig)
     }
 
+    override fun onStart() {
+        super.onStart()
+        viewModel.onForeground()
+    }
+
     override fun onPause() {
         super.onPause()
         viewModel.onLeaving()

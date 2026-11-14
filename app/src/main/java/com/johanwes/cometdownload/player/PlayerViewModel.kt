@@ -65,8 +65,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
     val player: ExoPlayer = buildPlayer(application)
     private val store = PlaybackStore(application)
 
-    // Lets headset and Bluetooth buttons control playback while the player is open.
-    private val session = MediaSession.Builder(application, player).setId("comet-player-${System.nanoTime()}").build()
+    // Lets headset and Bluetooth buttons control playback. Held only while the player is on
+    // screen: a session that outlives it lets a headset button start playback with nothing visible.
+    private var session: MediaSession? = null
 
     // Python takes a moment to start; nothing here needs it until subtitles are searched.
     private val backend by lazy { CometBackend.get(application) }
@@ -249,10 +250,19 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
      */
     fun onLeaving() = savePosition()
 
+    /** Called when the screen becomes visible. */
+    fun onForeground() {
+        if (session == null) {
+            session = MediaSession.Builder(getApplication<Application>(), player).setId("comet-player-${System.nanoTime()}").build()
+        }
+    }
+
     /** Called when the screen is no longer visible: there is no background playback. */
     fun onBackground() {
         player.pause()
         savePosition()
+        session?.release()
+        session = null
     }
 
     // --- Audio and subtitles --------------------------------------------------------------
@@ -446,7 +456,8 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
 
     override fun onCleared() {
         savePosition()
-        session.release()
+        session?.release()
+        session = null
         player.removeListener(this)
         player.release()
     }
