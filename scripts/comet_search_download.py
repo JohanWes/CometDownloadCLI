@@ -94,6 +94,7 @@ HEALTHCHECK_TIMEOUT = 60
 STREAM_RESULT_LIMIT = 3
 STARTUP_LOG_PATH = ROOT_DIR / "data" / "comet_search_download.log"
 CLI_LOG_LOCK = threading.Lock()
+CLI_LOG_MAX_BYTES = 2 * 1024 * 1024
 DEFAULT_TMDB_READ_ACCESS_TOKEN = "eyJhbGciOiJIUzI1NiJ9.eyJhdWQiOiJlNTkxMmVmOWFhM2IxNzg2Zjk3ZTE1NWY1YmQ3ZjY1MSIsInN1YiI6IjY1M2NjNWUyZTg5NGE2MDBmZjE2N2FmYyIsInNjb3BlcyI6WyJhcGlfcmVhZCJdLCJ2ZXJzaW9uIjoxfQ.xrIXsMFJpI1o1j5g2QpQcFP1X3AfRjFA5FlBFO5Naw8"
 TMDB_BASE_URL = "https://api.themoviedb.org/3"
 TMDB_HEADERS = {
@@ -159,8 +160,19 @@ def write_cli_log(level: str, message: str) -> None:
     line = f"{timestamp} {level.upper()}: {redact_sensitive_text(message)}\n"
     STARTUP_LOG_PATH.parent.mkdir(parents=True, exist_ok=True)
     with CLI_LOG_LOCK:
+        _rotate_cli_log()
         with STARTUP_LOG_PATH.open("a", encoding="utf-8") as log_file:
             log_file.write(line)
+
+
+def _rotate_cli_log() -> None:
+    """Keep the log bounded: past the size cap the current file becomes `.log.1` (one generation)."""
+    try:
+        if STARTUP_LOG_PATH.stat().st_size < CLI_LOG_MAX_BYTES:
+            return
+        os.replace(STARTUP_LOG_PATH, STARTUP_LOG_PATH.with_name(f"{STARTUP_LOG_PATH.name}.1"))
+    except OSError:
+        pass
 
 
 @dataclass
@@ -2722,8 +2734,9 @@ def extract_filename(headers, fallback_name: str, fallback_ext: str = ".mkv") ->
 def reserve_destination_path(output_dir: Path, filename: str) -> tuple[Path, Path]:
     destination = output_dir / filename
     suffix = 1
+    first = destination
     while destination.exists() or destination.with_name(f"{destination.name}.part").exists():
-        destination = destination.with_name(f"{destination.stem} ({suffix}){destination.suffix}")
+        destination = first.with_name(f"{first.stem} ({suffix}){first.suffix}")
         suffix += 1
     return destination, destination.with_name(f"{destination.name}.part")
 
