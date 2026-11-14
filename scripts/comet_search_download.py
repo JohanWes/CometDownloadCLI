@@ -2584,9 +2584,8 @@ def format_bytes(size_bytes: int) -> str:
 
 def print_streams(candidates: list[StreamCandidate]) -> None:
     if not candidates:
-        raise SystemExit(
-            "No streams matched the current filters for 4K/1080P, size, and English language."
-        )
+        UI.warning("No streams matched the current filters for 4K/1080P, size, and English language.")
+        raise PromptCancelled
 
     UI.show_stream_candidates(candidates)
 
@@ -3364,6 +3363,13 @@ def main() -> None:
             except PromptCancelled:
                 query_override = None
                 UI.info("Returned to search.")
+                continue
+            except Exception as error:
+                # One failed lookup (backend hiccup, network drop) must not end the session:
+                # leaving this loop shuts the manager down and cancels every running download.
+                message = redact_sensitive_text(str(error)) or type(error).__name__
+                write_cli_log("error", f"Search for {raw_value!r} failed: {message}")
+                UI.error(f"Search failed: {message}")
                 continue
     finally:
         shutdown_jobs = manager.shutdown()
