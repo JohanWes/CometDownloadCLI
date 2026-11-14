@@ -173,8 +173,16 @@ def friendly_error(error: BaseException | str) -> str:
     match = re.search(r"HTTP (\d{3})", text)
     code = int(match.group(1)) if match else getattr(error, "code", None)
     lower = text.lower()
-    if code in (401, 403) and "opensubtitles" not in lower:
-        return "Your debrid token was rejected. Check it in Settings."
+    if code in (401, 403):
+        # Only the debrid store API (StremThru /v0/store/...) answers for the token. A 403 from the
+        # file host or a metadata site says nothing about it.
+        if "/v0/store/" in lower:
+            return "Your debrid token was rejected. Check it in Settings."
+        if "opensubtitles" in lower:
+            return "OpenSubtitles rejected the login. Check the subtitle settings."
+        if "download server" in lower:
+            return f"The download link was refused (HTTP {code}). Retry to get a fresh link."
+        return f"The server refused the request (HTTP {code}). Try again in a bit."
     if code == 429:
         return "Too many requests right now. Wait a minute and try again."
     if isinstance(code, int) and code >= 500:
