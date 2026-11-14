@@ -2003,7 +2003,17 @@ def upsert_env_value(path: Path, key: str, value: str) -> bool:
         lines.append(new_line)
 
     path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    restrict_env_permissions(path)
     return True
+
+
+def restrict_env_permissions(path: Path) -> None:
+    """The env file holds API tokens and passwords, so keep it readable by its owner only."""
+    try:
+        if path.is_file() and path.stat().st_mode & 0o077:
+            path.chmod(0o600)
+    except OSError:
+        pass
 
 
 def load_env_values() -> dict[str, str]:
@@ -2136,9 +2146,9 @@ def http_json(
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         body = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"GET {url} failed with HTTP {error.code}: {body[:200]}")
+        raise RuntimeError(f"GET {redact_sensitive_text(url)} failed with HTTP {error.code}: {body[:200]}") from None
     except URLError as error:
-        raise RuntimeError(f"GET {url} failed: {error.reason}")
+        raise RuntimeError(f"GET {redact_sensitive_text(url)} failed: {error.reason}") from None
 
 
 def http_post_json(
@@ -2159,9 +2169,9 @@ def http_post_json(
             return json.loads(response.read().decode("utf-8"))
     except HTTPError as error:
         body = error.read().decode("utf-8", errors="replace")
-        raise RuntimeError(f"POST {url} failed with HTTP {error.code}: {body[:200]}")
+        raise RuntimeError(f"POST {redact_sensitive_text(url)} failed with HTTP {error.code}: {body[:200]}") from None
     except URLError as error:
-        raise RuntimeError(f"POST {url} failed: {error.reason}")
+        raise RuntimeError(f"POST {redact_sensitive_text(url)} failed: {error.reason}") from None
 
 
 def http_response(
@@ -3305,6 +3315,7 @@ def handle_command(raw_command: str, manager: DownloadManager) -> bool:
 
 def main() -> None:
     args = parse_args()
+    restrict_env_permissions(ENV_PATH)
     debrid = load_debrid_config(args.provider, args.token)
     subtitles = load_opensubtitles_config()
     base_output_dir, output_saved = resolve_output_dir(args.output_dir)
