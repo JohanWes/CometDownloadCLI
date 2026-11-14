@@ -1,7 +1,15 @@
 <resources>
-    <style name="AppTheme" parent="android:style/Theme.Material.Light.NoActionBar">
-        <item name="android:fontFamily">sans</item>
-        <item name="android:windowLightStatusBar">true</item>
-        <item name="android:colorAccent">#336b62</item>
+    <!-- Dark window theme so launch and system bars match the Compose UI (no white flash). -->
+    <style name="AppTheme" parent="android:style/Theme.Material.NoActionBar">
+        <item name="android:windowBackground">@color/window_background</item>
+        <item name="android:colorBackground">@color/window_background</item>
+        <item name="android:colorAccent">#7DD6C6</item>
+        <item name="android:windowLightStatusBar">false</item>
+    </style>
+
+    <!-- The player opens on black, like the video area it shows. -->
+    <style name="PlayerTheme" parent="AppTheme">
+        <item name="android:windowBackground">@android:color/black</item>
+        <item name="android:colorBackground">@android:color/black</item>
     </style>
 </resources>

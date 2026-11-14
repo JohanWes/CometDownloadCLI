@@ -1,0 +1,26 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp"
+    android:height="108dp"
+    android:viewportWidth="108"
+    android:viewportHeight="108">
+    <!-- Comet: tail streaks toward the upper left, head with a download arrow. -->
+    <path
+        android:fillColor="#7DD6C6"
+        android:fillAlpha="0.35"
+        android:pathData="M70.5,53.5 L28,28 L53.5,70.5 Z" />
+    <path
+        android:fillColor="#7DD6C6"
+        android:fillAlpha="0.6"
+        android:pathData="M68,56 L38,34 L56,68 Z" />
+    <path
+        android:fillColor="#7DD6C6"
+        android:fillAlpha="0.25"
+        android:pathData="M74,58 L52,26 L66,54 Z" />
+    <path
+        android:fillColor="#7DD6C6"
+        android:pathData="M62,48 A14,14 0 1,1 61.99,48 Z" />
+    <path
+        android:fillColor="#0F1513"
+        android:pathData="M60.5,54h3v7.4l2.9,-2.9 2.1,2.1L62,67.1l-6.5,-6.5 2.1,-2.1 2.9,2.9z" />
+</vector>
