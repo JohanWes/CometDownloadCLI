@@ -1,17 +1,21 @@
-import asyncio
 import base64
 import json
 import os
+from glob import escape as glob_escape
 import re
 import threading
 import time
 import xml.etree.ElementTree as ET
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote, urlencode, urlparse
 from urllib.request import Request, urlopen
 
+from comet import metadata
+from comet import subtitles as subs
 from comet.config import settings
+from comet.library import Library
 from scripts import comet_search_download as cli
 
 VIDEO_EXTENSIONS = (
@@ -90,6 +94,7 @@ def _stream_from_dict(value: dict[str, Any]) -> cli.StreamCandidate:
 
 
 def _job_to_dict(job: cli.DownloadJobSnapshot) -> dict[str, Any]:
+    files = _video_files(job)
     return {
         "job_id": job.job_id,
         "label": job.label,
@@ -107,10 +112,89 @@ def _job_to_dict(job: cli.DownloadJobSnapshot) -> dict[str, Any]:
         "speed_bytes_per_second": job.speed_bytes_per_second,
         "eta_seconds": job.eta_seconds,
         "destinations": [str(path) for path in job.destinations],
-        "error_text": job.error_text,
+        "error_text": friendly_error(job.error_text) if job.error_text else "",
         "cancel_requested": job.cancel_requested,
         "output_dir": str(job.output_dir),
+        "final_bytes": sum(item["bytes"] for item in files),
+        "files": files,
+        "subtitle_status": job.subtitle_status,
+        "subtitle_message": job.subtitle_message,
+        "embedded_subtitles": list(job.embedded_subtitles),
+        "media_type": job.media_type,
+        "imdb_id": job.imdb_id,
+        "season": job.season,
+        "episode": job.episode,
+        "title": job.title,
     }
+
+
+def _video_files(job: cli.DownloadJobSnapshot) -> list[dict[str, Any]]:
+    """The videos of a finished download: where each one is, which episode it is and its size."""
+    if job.status != "completed":
+        return []
+    files: list[dict[str, Any]] = []
+    for path in job.destinations:
+        if not _is_video_file(path.name):
+            continue
+        season, episode = 0, 0
+        if job.media_type == "series":
+            # The file name knows best (a season pack is one job with many episodes); what
+            # was asked for fills in whatever the name doesn't say.
+            named_season, named_episode = subs.season_episode_from_filename(path)
+            if named_episode is None:
+                named_episode = subs.episode_number_from_filename(path)
+            season = named_season or job.season or 0
+            episode = named_episode or job.episode or 0
+        try:
+            size = path.stat().st_size
+        except OSError:
+            size = 0
+        files.append({"path": str(path), "season": season, "episode": episode, "bytes": size})
+    return files
+
+
+_URL_PATTERN = re.compile(r"(?:https?|wss?)://\S+")
+_NETWORK_HINTS = (
+    "timed out", "name or service not known", "temporary failure in name resolution",
+    "network is unreachable", "connection refused", "connection reset", "no address associated",
+    "failed to establish", "connectionerror", "remote end closed",
+)
+
+
+def friendly_error(error: BaseException | str) -> str:
+    """Turns raw exceptions into one short line: no URLs, tokens or stack noise."""
+    text = str(error).strip() or getattr(error, "__class__", type("x", (), {})).__name__
+    match = re.search(r"HTTP (\d{3})", text)
+    code = int(match.group(1)) if match else getattr(error, "code", None)
+    lower = text.lower()
+    if code in (401, 403) and "opensubtitles" not in lower:
+        return "Your debrid token was rejected. Check it in Settings."
+    if code == 429:
+        return "Too many requests right now. Wait a minute and try again."
+    if isinstance(code, int) and code >= 500:
+        return f"The server had a problem (HTTP {code}). Try again in a bit."
+    if any(hint in lower for hint in _NETWORK_HINTS):
+        return "Network problem: couldn't reach the server. Check your connection."
+    if "no space left" in lower:
+        return "Not enough free space on the device to finish this download."
+    if "permission denied" in lower or "operation not permitted" in lower:
+        return "Can't write to the Download folder. Allow file access for Comet and try again."
+    text = _URL_PATTERN.sub("", text)
+    text = re.sub(r"\b(?:GET|POST)\s+failed", "Request failed", text)
+    text = re.sub(r"\s+", " ", text).strip(" :")
+    return text[:200] + ("…" if len(text) > 200 else "")
+
+
+def _friendly(method):
+    def wrapper(*args, **kwargs):
+        try:
+            return method(*args, **kwargs)
+        except Exception as error:
+            raise RuntimeError(friendly_error(error)) from None
+
+    wrapper.__name__ = method.__name__
+    wrapper.__doc__ = method.__doc__
+    return wrapper
 
 
 def _extract_playback_token(playback_url: str) -> str:
@@ -412,17 +496,128 @@ def _generate_download_link(provider: str, token: str, file_link: str) -> str:
     return link
 
 
-def _resolve_download_links(playback_url: str) -> list[tuple[str, str]]:
+ANDROID_STREAM_LIMIT = 12
+PROVIDER_LABELS = {"realdebrid": "Real-Debrid", "torbox": "TorBox"}
+UNCACHED_POLL_SECONDS = 30
+UNCACHED_MAX_WAIT_SECONDS = 6 * 3600
+# Polls in a row that may be refused (HTTP 4xx) before the wait is given up.
+UNCACHED_MAX_REFUSED_POLLS = 4
+_READY_STATUSES = {"cached", "downloaded"}
+_DEAD_STATUSES = {"failed", "invalid"}
+
+
+def _store_headers(provider: str, token: str) -> dict[str, str]:
+    return {
+        "X-StremThru-Store-Name": provider,
+        "X-StremThru-Store-Authorization": f"Bearer {token}",
+        "User-Agent": "comet-minimal",
+    }
+
+
+def _get_magnet(provider: str, token: str, magnet_id: str) -> dict[str, Any]:
+    return cli.http_json(
+        f"{settings.stremthru_url}/v0/store/magnets/{quote(magnet_id)}?client_ip=",
+        headers=_store_headers(provider, token),
+        timeout=settings.stremthru_timeout_seconds,
+    )
+
+
+def _parse_playback(playback_url: str) -> tuple[str, str, dict[str, Any]]:
     token = _extract_playback_token(playback_url)
     path = urlparse(playback_url).path or playback_url
     b64config = [part for part in path.split("/") if part][0]
     provider, provider_token = _parse_config(b64config)
-    payload = _decode_playback_payload(token)
+    # The link carries the token it was listed with. A token corrected in Settings since
+    # then must also apply to queued jobs and retries, or they keep failing with the old one.
+    current = _api
+    if current is not None and current.provider == provider and current.token:
+        provider_token = current.token
+    return provider, provider_token, _decode_playback_payload(token)
+
+
+def _wait_for_magnet(
+    provider: str,
+    provider_token: str,
+    payload: dict[str, Any],
+    magnet: dict[str, Any],
+    *,
+    on_wait,
+    cancel_event: threading.Event | None = None,
+) -> dict[str, Any]:
+    """Polls the debrid service until it has fetched the torrent; returns the ready magnet."""
+    label = PROVIDER_LABELS.get(provider, "your debrid service")
+    status = str(magnet.get("status", "")).lower()
+    started = time.time()
+    refused_polls = 0
+    while status not in _READY_STATUSES:
+        if status in _DEAD_STATUSES:
+            raise RuntimeError(f"{label} couldn't fetch this torrent (status: {status}). Try another stream.")
+        if time.time() - started > UNCACHED_MAX_WAIT_SECONDS:
+            raise RuntimeError(f"Gave up after waiting 6 hours for {label} to fetch this torrent.")
+        on_wait(label, status or "queued")
+        if cancel_event is not None:
+            if cancel_event.wait(UNCACHED_POLL_SECONDS):
+                raise cli.DownloadCancelled()
+        else:
+            time.sleep(UNCACHED_POLL_SECONDS)
+        magnet_id = str(magnet.get("id") or "")
+        try:
+            refreshed = _get_magnet(provider, provider_token, magnet_id) if magnet_id else _add_magnet(
+                provider, provider_token, payload["info_hash"], payload["torrent_title"]
+            )
+        except Exception as error:
+            # Timeouts, dropped connections and server hiccups are expected over a wait of
+            # hours (they don't all surface as RuntimeError), so keep waiting. A request the
+            # service keeps refusing (token revoked, torrent removed) won't fix itself.
+            text = str(error)
+            refused = re.search(r"HTTP 4\d\d", text) and "HTTP 429" not in text
+            refused_polls = refused_polls + 1 if refused else 0
+            if refused_polls >= UNCACHED_MAX_REFUSED_POLLS:
+                if re.search(r"HTTP 40[13]", text):
+                    raise  # reported as a rejected token
+                raise RuntimeError(
+                    f"{label} no longer lists this torrent, so the wait was stopped. Try again or pick another stream."
+                ) from None
+            continue
+        refused_polls = 0
+        magnet = refreshed.get("data") or magnet
+        status = str(magnet.get("status", "")).lower()
+    return magnet
+
+
+def _resolve_download_links(
+    playback_url: str,
+    *,
+    on_wait=None,
+    cancel_event: threading.Event | None = None,
+    defer: bool = False,
+) -> list[tuple[str, str]]:
+    """Download links for the stream's files. An uncached torrent is added to the debrid
+    account; with [on_wait] we then poll until the service has fetched it. With [defer] that
+    wait is handed to the download manager (cli.JobDeferred) instead of blocking the caller,
+    which simply asks again once the wait is over."""
+    provider, provider_token, payload = _parse_playback(playback_url)
     added = _add_magnet(provider, provider_token, payload["info_hash"], payload["torrent_title"])
     magnet = added.get("data") or {}
     status = str(magnet.get("status", "")).lower()
-    if status not in {"cached", "downloaded"}:
-        raise RuntimeError(f"The selected torrent is not cached yet (status: {status or 'unknown'}).")
+    label = PROVIDER_LABELS.get(provider, "your debrid service")
+    if status not in _READY_STATUSES:
+        if status in _DEAD_STATUSES:
+            raise RuntimeError(f"{label} couldn't fetch this torrent (status: {status}). Try another stream.")
+        if on_wait is None:
+            raise RuntimeError(
+                f"Not cached yet. {label} has started fetching it"
+                f" (status: {status or 'unknown'}); retry once it's ready."
+            )
+
+        def wait() -> dict[str, Any]:
+            return _wait_for_magnet(
+                provider, provider_token, payload, magnet, on_wait=on_wait, cancel_event=cancel_event
+            )
+
+        if defer:
+            raise cli.JobDeferred(wait)
+        magnet = wait()
     target_files = _choose_files(payload, magnet.get("files") or [])
     downloads: list[tuple[str, str]] = []
     for target_file in target_files:
@@ -454,8 +649,17 @@ def _download_selected_stream_direct(
     if cancel_event is not None and cancel_event.is_set():
         raise cli.DownloadCancelled()
 
-    downloads = _resolve_download_links(candidate.playback_url)
+    def on_wait(label: str, status: str) -> None:
+        if reporter is not None:
+            reporter.update_job_phase(f"Waiting for {label} to fetch it ({status})")
+
+    # Under the download manager an uncached torrent is waited for off the worker pool
+    # (JobDeferred), so it doesn't block a download slot for hours.
+    downloads = _resolve_download_links(
+        candidate.playback_url, on_wait=on_wait, cancel_event=cancel_event, defer=reporter is not None
+    )
     if reporter is not None:
+        reporter.set_resolving()
         reporter.set_total_files(len(downloads))
 
     destinations: list[Path] = []
@@ -479,15 +683,113 @@ def _download_selected_stream_direct(
 
 
 class AndroidCometApi:
-    def __init__(self, download_dir: str, max_parallel: int = 2) -> None:
+    def __init__(self, download_dir: str, max_parallel: int = 2, state_dir: str = "") -> None:
         self.provider = ""
         self.token = ""
-        self.subtitles = cli.OpenSubtitlesConfig(api_key="", username="", password="")
+        self.subtitles = subs.OpenSubtitlesConfig(api_key="", username="", password="")
         self.download_dir = Path(download_dir).expanduser()
         self.events: list[dict[str, Any]] = []
         self._event_lock = threading.Lock()
+        # job_id -> the request that created it, so failed jobs can be retried.
+        self._requests: dict[int, tuple[str, str, int | None, int | None]] = {}
+        self._requests_lock = threading.Lock()
+        self._sweep_stale_partials()
         cli.download_selected_stream = _download_selected_stream_direct
-        self.manager = cli.DownloadManager(max_parallel, event_callback=self._record_event)
+        # Finished downloads are kept on disk so they are still listed after a restart.
+        self.library = Library(Path(state_dir) / "library.json") if state_dir else None
+        # Plot, rating and artwork of every title in the library, kept for offline use.
+        self.meta = metadata.MetaStore(Path(state_dir) / "metadata") if state_dir else None
+        self._restoring = True
+        self.manager = cli.DownloadManager(
+            max_parallel, event_callback=self._record_event, change_callback=self._save_library
+        )
+        self._restore_library()
+        self._restoring = False
+
+    def _restore_library(self) -> None:
+        if self.library is None:
+            return
+        for record in self.library.load():
+            try:
+                request = record["request"]
+                media_json = json.dumps(request["media"])
+                stream_json = json.dumps(request["stream"])
+                season, episode = request.get("season"), request.get("episode")
+                files = {int(file_id): Path(path) for file_id, path in (record.get("subtitle_files") or {}).items()}
+                job = self.manager.restore_completed(
+                    label=str(record["label"]),
+                    candidate=_stream_from_dict(request["stream"]),
+                    subtitles=self.subtitles,
+                    media=_media_from_dict(request["media"]),
+                    season=season,
+                    episode=episode,
+                    output_dir=Path(record["output_dir"]),
+                    fallback_name=str(record["label"]),
+                    created_at=float(record.get("created_at") or 0),
+                    finished_at=float(record.get("finished_at") or 0),
+                    destinations=[Path(path) for path in record["destinations"]],
+                    total_files=int(record.get("total_files") or 1),
+                    completed_files=int(record.get("total_files") or 1),
+                    subtitle_status=str(record.get("subtitle_status") or ""),
+                    subtitle_message=str(record.get("subtitle_message") or ""),
+                    embedded_subtitles=list(record.get("embedded_subtitles") or []),
+                    subtitle_file_ids=[int(file_id) for file_id in record.get("subtitle_file_ids") or []],
+                    subtitle_files={file_id: path for file_id, path in files.items() if path.exists()},
+                    subtitle_sidecars={
+                        Path(item["video"]): (Path(item["path"]), str(item["language"]))
+                        for item in record.get("sidecars") or []
+                    },
+                )
+            except (KeyError, TypeError, ValueError):
+                continue  # a record from an incompatible version: skip it, keep the rest
+            self._requests[job.job_id] = (media_json, stream_json, season, episode)
+
+    def _save_library(self) -> None:
+        if self.library is None or self._restoring:
+            return
+
+        def describe(job: cli.DownloadJob) -> dict[str, Any] | None:
+            request = self._requests.get(job.job_id)
+            if request is None:
+                return None
+            media_json, stream_json, season, episode = request
+            return {
+                "request": {
+                    "media": json.loads(media_json),
+                    "stream": json.loads(stream_json),
+                    "season": season,
+                    "episode": episode,
+                },
+                "label": job.label,
+                "output_dir": str(job.output_dir),
+                "destinations": [str(path) for path in job.destinations],
+                "created_at": job.created_at,
+                "finished_at": job.finished_at,
+                "total_files": job.total_files,
+                # A lookup that is still running is simply not remembered as such.
+                "subtitle_status": "" if job.subtitle_status == "searching" else job.subtitle_status,
+                "subtitle_message": "" if job.subtitle_status == "searching" else job.subtitle_message,
+                "embedded_subtitles": list(job.embedded_subtitles),
+                "subtitle_file_ids": list(job.subtitle_file_ids),
+                "subtitle_files": {str(file_id): str(path) for file_id, path in job.subtitle_files.items()},
+                "sidecars": [
+                    {"video": str(video), "path": str(path), "language": language}
+                    for video, (path, language) in job.subtitle_sidecars.items()
+                ],
+            }
+
+        self.library.save([record for record in self.manager.map_completed(describe) if record is not None])
+
+    def _sweep_stale_partials(self) -> None:
+        """Staging dirs left by a killed process (jobs never survive a restart)."""
+        try:
+            stale = list(self.download_dir.glob(".*.job-*.partial"))
+        except OSError:
+            return
+        for path in stale:
+            cli.cleanup_download_dir(path)
+        if stale:
+            self._record_event("info", f"Removed {len(stale)} unfinished download folder(s) from a previous session.")
 
     def _record_event(self, level: str, message: str) -> None:
         with self._event_lock:
@@ -501,6 +803,7 @@ class AndroidCometApi:
         opensubtitles_api_key: str = "",
         opensubtitles_username: str = "",
         opensubtitles_password: str = "",
+        subtitle_languages: str = "",
     ) -> str:
         provider = provider.strip().lower()
         if provider not in cli.DEBRID_PROVIDERS:
@@ -510,19 +813,31 @@ class AndroidCometApi:
             raise RuntimeError("A provider API token is required.")
         self.provider = provider
         self.token = token
-        self.subtitles = cli.OpenSubtitlesConfig(
+        self.subtitles = subs.OpenSubtitlesConfig(
             api_key=opensubtitles_api_key.strip(),
             username=opensubtitles_username.strip(),
             password=opensubtitles_password.strip(),
+            languages=subs.parse_subtitle_languages(subtitle_languages),
         )
         return "ok"
 
+    @_friendly
     def search(self, query: str) -> str:
         query = query.strip()
         if not query:
             raise RuntimeError("Enter a search query.")
+        try:
+            return json.dumps(metadata.search(query))
+        except Exception as error:
+            self._record_event("warning", f"Cinemeta search failed, using TMDB: {error}")
         return json.dumps([_media_to_dict(media) for media in cli.search_tmdb(query)])
 
+    @_friendly
+    def details(self, media_json: str, refresh: bool = False) -> str:
+        media = _media_from_dict(json.loads(media_json))
+        return json.dumps(metadata.details(media.media_type, media.imdb_id, bool(refresh)))
+
+    @_friendly
     def streams(
         self,
         media_json: str,
@@ -547,9 +862,10 @@ class AndroidCometApi:
             season=int(season) if season is not None and int(season) > 0 else None,
             episode=int(episode) if episode is not None and int(episode) > 0 else None,
         )
-        grouped = cli.group_top_streams(cli.build_stream_candidates(raw_streams, context))
+        grouped = cli.group_top_streams(cli.build_stream_candidates(raw_streams, context), limit=ANDROID_STREAM_LIMIT)
         return json.dumps([_stream_to_dict(stream) for stream in grouped])
 
+    @_friendly
     def enqueue(
         self,
         media_json: str,
@@ -568,21 +884,295 @@ class AndroidCometApi:
             episode=actual_episode,
         )
         target_dir = self.download_dir / cli.build_collection_dir_name(media, season=actual_season)
-        job = self.manager.enqueue(
-            label=preferred_name,
-            host="",
-            candidate=stream,
-            subtitles=self.subtitles,
-            media=media,
-            season=actual_season,
-            episode=actual_episode,
-            output_dir=target_dir,
-            fallback_name=preferred_name,
-        )
+        with self._requests_lock:  # a concurrent clear_finished must not drop the new entry
+            job = self.manager.enqueue(
+                label=preferred_name,
+                host="",
+                candidate=stream,
+                subtitles=self.subtitles,
+                media=media,
+                season=actual_season,
+                episode=actual_episode,
+                output_dir=target_dir,
+                fallback_name=preferred_name,
+            )
+            self._requests[job.job_id] = (media_json, stream_json, actual_season, actual_episode)
+        if self.meta is not None:
+            # Queuing means there is a connection right now; the library may be opened without one.
+            threading.Thread(
+                target=self.meta.ensure, args=(media.media_type, media.imdb_id), name="library-meta", daemon=True
+            ).start()
         return json.dumps(_job_to_dict(job))
 
+    @_friendly
+    def retry(self, job_id: int) -> str:
+        request = self._requests.get(int(job_id))
+        if request is None:
+            raise RuntimeError("This download can't be retried. Search for it again.")
+        media_json, stream_json, season, episode = request
+        result = self.enqueue(media_json, stream_json, season, episode)
+        self.manager.remove(int(job_id))
+        self._requests.pop(int(job_id), None)
+        return result
+
+    @_friendly
+    def refetch_subtitles(self, job_id: int, try_another: bool = False) -> str:
+        if not self.subtitles.is_configured:
+            raise RuntimeError("Add your OpenSubtitles details in Settings first.")
+        if not self.manager.refetch_subtitles(int(job_id), self.subtitles, bool(try_another)):
+            raise RuntimeError("Subtitles can only be fetched for finished downloads.")
+        return "ok"
+
+    def subtitle_languages(self) -> str:
+        """Languages offered when looking for more subtitles: the preferred ones first."""
+        preferred = list(self.subtitles.languages)
+        others = sorted(
+            (code for code in subs.SUBTITLE_LANGUAGE_NAMES if code not in preferred),
+            key=subs.subtitle_language_name,
+        )
+        return json.dumps(
+            [
+                {"code": code, "name": subs.subtitle_language_name(code), "preferred": code in preferred}
+                for code in preferred + others
+            ]
+        )
+
+    def _subtitle_session(self) -> subs.OpenSubtitlesSession:
+        if not self.subtitles.is_configured:
+            raise RuntimeError("Add your OpenSubtitles details in Settings first.")
+        if not self.subtitles.has_login:
+            raise RuntimeError("Add your OpenSubtitles username and password in Settings to download subtitles.")
+        session = subs.OpenSubtitlesSession(self.subtitles)
+        if not session.token:
+            raise RuntimeError(session.login_error or "Could not sign in to OpenSubtitles.")
+        return session
+
+    def subtitle_search(self, video_path: str, languages: str = "") -> str:
+        """Subtitles on OpenSubtitles for one downloaded video, best match first. Ones that
+        were downloaded before carry the path of their file."""
+        video = Path(video_path)
+        if not video.is_file():
+            raise RuntimeError("The video file was moved or deleted.")
+        job = self.manager.job_for_file(video)
+        media_type, imdb_id, season, episode = "movie", "", None, None
+        known: dict[int, Path] = {}
+        if job is not None:
+            media_type, imdb_id = job.media.media_type, job.media.imdb_id
+            known = dict(job.subtitle_files)
+            if media_type == "series":
+                season, episode = subs.season_episode_from_filename(video)
+                if episode is None:
+                    episode = subs.episode_number_from_filename(video) or job.episode
+                season = season or job.season
+                if season is None or episode is None:
+                    imdb_id = ""  # can't tell which episode this is: go by file name instead
+        wanted = subs.parse_subtitle_languages(languages) if languages.strip() else self.subtitles.languages
+        try:
+            choices = subs.search_subtitles(
+                self._subtitle_session(),
+                media_type=media_type,
+                imdb_id=imdb_id,
+                video_path=video,
+                season=season,
+                episode=episode,
+                languages=wanted,
+            )
+        except subs.OpenSubtitlesError as error:
+            raise RuntimeError(str(error)) from None
+        return json.dumps(
+            [
+                {
+                    "file_id": choice.file_id,
+                    "language": choice.language,
+                    "language_name": subs.subtitle_language_name(choice.language),
+                    "release": choice.release,
+                    "hash_match": choice.hash_match,
+                    "hearing_impaired": choice.hearing_impaired,
+                    "machine_translated": choice.machine_translated,
+                    "download_count": choice.download_count,
+                    "path": str(known[choice.file_id])
+                    if choice.file_id in known and known[choice.file_id].exists()
+                    else "",
+                }
+                for choice in choices[:60]
+            ]
+        )
+
+    def subtitle_download(self, video_path: str, file_id: int, language: str) -> str:
+        """Saves one more subtitle next to the video; returns its path and the daily quota left."""
+        video = Path(video_path)
+        if not video.is_file():
+            raise RuntimeError("The video file was moved or deleted.")
+        try:
+            path, remaining = subs.download_subtitle_file(
+                self._subtitle_session(), int(file_id), language.strip().lower() or "en", video
+            )
+        except subs.OpenSubtitlesQuotaError:
+            raise RuntimeError("Daily OpenSubtitles download limit reached.") from None
+        except subs.OpenSubtitlesError as error:
+            raise RuntimeError(str(error)) from None
+        except OSError as error:
+            raise RuntimeError(friendly_error(error)) from None
+        job = self.manager.job_for_file(video)
+        if job is not None:
+            self.manager.record_subtitle(job, path, int(file_id), language)
+        return json.dumps({"path": str(path), "remaining": remaining if remaining is not None else -1})
+
+    def remove_job(self, job_id: int, delete_files: bool = False) -> bool:
+        """Takes a finished download off the list, optionally deleting what it saved."""
+        job_id = int(job_id)
+        files = next((job.destinations for job in self.manager.snapshot() if job.job_id == job_id), ())
+        output_dir = next((job.output_dir for job in self.manager.snapshot() if job.job_id == job_id), None)
+        with self._requests_lock:
+            removed = self.manager.remove(job_id)
+            if removed:
+                self._requests.pop(job_id, None)
+        if removed and delete_files:
+            self._delete_from_disk(files, output_dir)
+        if removed:
+            self._prune_meta()
+        return removed
+
+    def delete_files(self, job_id: int, paths_json: str) -> bool:
+        """Deletes some videos of a finished download (one episode of a season pack, say),
+        with their subtitles. The download leaves the library once none of its videos is left."""
+        job_id = int(job_id)
+        job = next((job for job in self.manager.snapshot() if job.job_id == job_id), None)
+        if job is None or job.status != "completed":
+            return False
+        wanted = {Path(str(path)) for path in json.loads(paths_json)}
+        # Only what this download saved: the paths come from the UI, the deleting happens here.
+        videos = [path for path in job.destinations if path in wanted and _is_video_file(path.name)]
+        if not videos:
+            return False
+        doomed: list[Path] = []
+        for video in videos:
+            prefix = video.stem + "."
+            doomed.append(video)
+            doomed.extend(
+                path
+                for path in job.destinations
+                if path.parent == video.parent and path.name.startswith(prefix) and not _is_video_file(path.name)
+            )
+        videos_left = self.manager.drop_files(job_id, doomed)
+        if not videos_left:
+            with self._requests_lock:
+                if self.manager.remove(job_id):
+                    self._requests.pop(job_id, None)
+        self._delete_from_disk(videos, job.output_dir)
+        self._prune_meta()
+        return True
+
+    def _delete_from_disk(self, files, output_dir: Path | None) -> None:
+        for path in files:
+            # Subtitles fetched in other ways (same name, other suffix) go with their video.
+            extras = path.parent.glob(glob_escape(path.stem) + ".*.srt") if _is_video_file(path.name) else ()
+            for target in (path, *extras):
+                try:
+                    target.unlink(missing_ok=True)
+                except OSError:
+                    pass
+        try:
+            if output_dir is not None and output_dir != self.download_dir:
+                output_dir.rmdir()  # only when nothing else is left in it
+        except OSError:
+            pass
+
+    def _prune_meta(self) -> None:
+        """Drops stored details and artwork of titles that have no download left."""
+        if self.meta is not None:
+            self.meta.prune({job.imdb_id for job in self.manager.snapshot()})
+
+    def library_details(self, fetch: bool = False) -> str:
+        """Details (plot, rating, artwork paths, episode titles) per IMDb id, for every title
+        with a download. Without [fetch] only what is stored on the device is returned, which
+        is instant and works offline; with it, missing and week-old entries are fetched first."""
+        if self.meta is None:
+            return "{}"
+        titles = {job.imdb_id: job.media_type for job in self.manager.snapshot() if job.imdb_id}
+        if not fetch:
+            stored = {imdb_id: self.meta.load(imdb_id) for imdb_id in titles}
+        else:
+            with ThreadPoolExecutor(max_workers=4) as pool:
+                futures = {
+                    imdb_id: pool.submit(self.meta.ensure, media_type, imdb_id)
+                    for imdb_id, media_type in titles.items()
+                }
+                stored = {imdb_id: future.result() for imdb_id, future in futures.items()}
+        return json.dumps({imdb_id: value for imdb_id, value in stored.items() if value})
+
+    def test_debrid(self, provider: str, token: str) -> str:
+        """One-line account summary, or raises with a readable reason."""
+        provider = provider.strip().lower()
+        token = token.strip()
+        if not token:
+            raise RuntimeError("Enter a token first.")
+        try:
+            if provider == "realdebrid":
+                user = cli.http_json(
+                    "https://api.real-debrid.com/rest/1.0/user",
+                    headers={"Authorization": f"Bearer {token}", "User-Agent": "comet-minimal"},
+                    timeout=15,
+                )
+                kind = str(user.get("type") or "").lower()
+                until = str(user.get("expiration") or "")[:10]
+                plan = f"premium until {until}" if kind == "premium" and until else (kind or "free")
+                return f"Connected as {user.get('username') or 'unknown'} · {plan}"
+            if provider == "torbox":
+                payload = cli.http_json(
+                    "https://api.torbox.app/v1/api/user/me",
+                    headers={"Authorization": f"Bearer {token}", "User-Agent": "comet-minimal"},
+                    timeout=15,
+                )
+                data = payload.get("data") or {}
+                plans = {0: "free plan", 1: "Essential", 2: "Pro", 3: "Standard"}
+                plan = plans.get(data.get("plan"), "active plan")
+                until = str(data.get("premium_expires_at") or "")[:10]
+                return f"Connected · {plan}" + (f" until {until}" if until else "")
+        except Exception as error:  # timeouts and bad JSON don't arrive as RuntimeError
+            if re.search(r"HTTP (401|403)", str(error)):
+                raise RuntimeError(f"{PROVIDER_LABELS.get(provider, 'The service')} rejected this token.") from None
+            raise RuntimeError(friendly_error(error)) from None
+        raise RuntimeError("Choose Real-Debrid or TorBox.")
+
+    def test_opensubtitles(self, api_key: str, username: str, password: str) -> str:
+        config = subs.OpenSubtitlesConfig(api_key.strip(), username.strip(), password.strip())
+        if not config.api_key:
+            raise RuntimeError("Enter an API key first.")
+        if not config.has_login:
+            raise RuntimeError("Enter your username and password too; downloads need a login.")
+        try:
+            payload = subs.opensubtitles_request(
+                config,
+                f"{subs.OPENSUBTITLES_DEFAULT_BASE_URL}/login",
+                payload={"username": config.username, "password": config.password},
+            )
+        except subs.OpenSubtitlesError as error:
+            if error.status in (400, 401, 403):
+                raise RuntimeError("OpenSubtitles rejected the API key, username or password.") from None
+            raise RuntimeError(str(error)) from None
+        # A successful sign-in clears any "rejected recently" back-off for these details.
+        subs.OPENSUBTITLES_LOGIN_FAILURES.pop((config.api_key, config.username, config.password), None)
+        user = payload.get("user") or {}
+        allowed = user.get("allowed_downloads")
+        return "Signed in" + (f" · {allowed} subtitle downloads a day" if allowed else "")
+
+    def active_count(self) -> int:
+        return sum(1 for job in self.manager.snapshot() if job.status in {"queued", "resolving", "downloading"})
+
     def jobs(self) -> str:
-        return json.dumps([_job_to_dict(job) for job in self.manager.snapshot()])
+        """Every job, each with the title it was queued for (poster, rating... as searched)."""
+        rows = []
+        for job in self.manager.snapshot():
+            row = _job_to_dict(job)
+            request = self._requests.get(job.job_id)
+            if request is not None:
+                try:
+                    row["media"] = json.loads(request[0])
+                except ValueError:
+                    pass
+            rows.append(row)
+        return json.dumps(rows)
 
     def events_json(self) -> str:
         with self._event_lock:
@@ -592,17 +1182,27 @@ class AndroidCometApi:
         return self.manager.cancel(int(job_id))
 
     def clear_finished(self) -> int:
-        return self.manager.clear_finished()
+        """Drops failed and cancelled jobs. Completed ones stay: they are the library."""
+        with self._requests_lock:
+            removed = self.manager.clear_finished(("failed", "cancelled"))
+            remaining = {job.job_id for job in self.manager.snapshot()}
+            for job_id in [job_id for job_id in self._requests if job_id not in remaining]:
+                self._requests.pop(job_id, None)
+        self._prune_meta()
+        return removed
 
     def shutdown(self) -> str:
         return json.dumps([_job_to_dict(job) for job in self.manager.shutdown()])
 
 
 _api: AndroidCometApi | None = None
+_api_lock = threading.Lock()
 
 
-def get_api(download_dir: str, max_parallel: int = 2) -> AndroidCometApi:
+def get_api(download_dir: str, max_parallel: int = 2, state_dir: str = "") -> AndroidCometApi:
+    """The one download manager of this process (the activity and the service share it)."""
     global _api
-    if _api is None:
-        _api = AndroidCometApi(download_dir, max_parallel=max_parallel)
-    return _api
+    with _api_lock:
+        if _api is None:
+            _api = AndroidCometApi(download_dir, max_parallel=max_parallel, state_dir=state_dir)
+        return _api
