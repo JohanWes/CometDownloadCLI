@@ -694,7 +694,7 @@ private fun LazyListScope.streamItems(
                     }
                 }
                 val shown = if (resolution in expanded) group else group.take(STREAMS_SHOWN)
-                items(shown, key = { it.json }) { stream ->
+                items(shown, key = { it.key }) { stream ->
                     StreamRow(
                         stream = stream,
                         state = viewModel.streamState(stream),

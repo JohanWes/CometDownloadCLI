@@ -67,6 +67,8 @@ fun CometApp(viewModel: CometViewModel, onExit: () -> Unit) {
         val snackbar = remember { SnackbarHostState() }
         val resultsListState = rememberLazyListState()
         val libraryGridState = rememberLazyGridState()
+        // The list keeps its place while a title is open, but a new search starts at the top.
+        LaunchedEffect(viewModel.searchCount) { resultsListState.requestScrollToItem(0) }
         val activeCount = viewModel.jobs.count { it.isActive }
 
         LifecycleStartEffect(viewModel) {

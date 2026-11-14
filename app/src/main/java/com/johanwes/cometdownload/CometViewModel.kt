@@ -79,6 +79,10 @@ class CometViewModel(application: Application) : AndroidViewModel(application) {
         private set
     var results by mutableStateOf<Load<List<MediaItem>>>(Load.Idle)
         private set
+
+    /** Goes up with every search that is started, so the results list can start at the top again. */
+    var searchCount by mutableIntStateOf(0)
+        private set
     var recentSearches by mutableStateOf(loadRecent())
         private set
 
@@ -148,6 +152,7 @@ class CometViewModel(application: Application) : AndroidViewModel(application) {
         if (text.isBlank()) return
         searchJob?.cancel()
         lastQuery = text
+        searchCount++
         results = Load.Loading
         searchJob = viewModelScope.launch {
             results = call { backend.search(text) }.fold(
