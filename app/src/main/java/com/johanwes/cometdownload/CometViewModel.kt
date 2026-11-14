@@ -59,8 +59,10 @@ sealed interface StreamState {
 class CometViewModel(application: Application) : AndroidViewModel(application) {
     private val store = SettingsStore(application)
     // Comes up already configured from the stored settings.
-    private val backend = CometBackend.get(application)
-    val downloadsPath: String = backend.downloadsPath
+    // Starting Python and restoring the library takes a moment, so the first use happens on a
+    // background thread (see init) and never while the first frame is being drawn.
+    private val backend by lazy { CometBackend.get(application) }
+    val downloadsPath: String = CometBackend.downloadsDir().absolutePath
 
     private val uiPrefs: SharedPreferences = application.getSharedPreferences("comet_ui", Context.MODE_PRIVATE)
 
@@ -141,9 +143,11 @@ class CometViewModel(application: Application) : AndroidViewModel(application) {
 
     init {
         refreshFreeSpace()
-        // Activity recreated while downloads run (same process): make sure the service is up.
-        if (runCatching { backend.activeCount() }.getOrDefault(0) > 0) {
-            DownloadForegroundService.start(application)
+        viewModelScope.launch {
+            // Activity recreated while downloads run (same process): make sure the service is up.
+            if (call { backend.activeCount() }.getOrDefault(0) > 0) {
+                DownloadForegroundService.start(application)
+            }
         }
     }
 

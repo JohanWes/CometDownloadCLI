@@ -5,6 +5,7 @@ import android.os.Environment
 import com.chaquo.python.PyObject
 import com.chaquo.python.Python
 import com.chaquo.python.android.AndroidPlatform
+import java.io.File
 import org.json.JSONArray
 import org.json.JSONObject
 
@@ -123,9 +124,12 @@ class CometBackend private constructor(private val api: PyObject, val downloadsP
             instance ?: create(context.applicationContext).also { instance = it }
         }
 
+        /** Where downloads are saved. Known without starting Python. */
+        fun downloadsDir(): File = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+
         private fun create(context: Context): CometBackend {
             if (!Python.isStarted()) Python.start(AndroidPlatform(context))
-            val downloads = Environment.getExternalStoragePublicDirectory(Environment.DIRECTORY_DOWNLOADS)
+            val downloads = downloadsDir()
             downloads.mkdirs()
             val api = Python.getInstance()
                 .getModule("comet.android_api")
