@@ -745,7 +745,7 @@ private fun LazyListScope.streamItems(
             streams.value.groupBy { it.resolutionLabel }.forEach { (resolution, group) ->
                 item(key = "header-$resolution") {
                     Row(
-                        modifier = Modifier.padding(start = 20.dp, end = 16.dp, top = 12.dp),
+                        modifier = Modifier.animateItem().padding(start = 20.dp, end = 16.dp, top = 12.dp),
                         verticalAlignment = Alignment.Bottom,
                         horizontalArrangement = Arrangement.spacedBy(8.dp),
                     ) {
@@ -768,14 +768,14 @@ private fun LazyListScope.streamItems(
                         providerLabel = viewModel.settings.provider.label,
                         onQueue = { viewModel.enqueue(stream) },
                         onShowDownloads = viewModel::showDownloads,
-                        modifier = Modifier.padding(horizontal = 16.dp),
+                        modifier = Modifier.animateItem().padding(horizontal = 16.dp),
                     )
                 }
                 if (group.size > shown.size) {
                     item(key = "more-$resolution") {
                         TextButton(
                             onClick = { onExpand(resolution) },
-                            modifier = Modifier.padding(start = 8.dp),
+                            modifier = Modifier.animateItem().padding(start = 8.dp),
                         ) { Text("Show ${group.size - shown.size} more $resolution") }
                     }
                 }
@@ -883,7 +883,7 @@ private fun StreamRow(
             if (job != null && job.isActive) {
                 if (progress != null && job.state == JobState.Downloading) {
                     LinearProgressIndicator(
-                        progress = { progress },
+                        progress = glide(progress),
                         gapSize = 0.dp,
                         drawStopIndicator = {},
                         modifier = Modifier.fillMaxWidth().height(3.dp),

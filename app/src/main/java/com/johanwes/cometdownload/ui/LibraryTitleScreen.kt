@@ -1,5 +1,7 @@
 package com.johanwes.cometdownload.ui
 
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
@@ -424,9 +426,15 @@ private fun VideoRow(
                 if (illustrated) {
                     EpisodeStill(video = video, number = number, upNext = highlighted, modifier = Modifier.width(StillWidth))
                 } else {
-                    Box(Modifier.width(32.dp), contentAlignment = Alignment.Center) {
+                    AnimatedContent(
+                        targetState = video.watched,
+                        transitionSpec = { IconSwap },
+                        contentAlignment = Alignment.Center,
+                        modifier = Modifier.width(32.dp),
+                        label = "watched",
+                    ) { watched ->
                         when {
-                            video.watched -> Icon(Icons.Default.Check, contentDescription = "Watched", tint = colors.primary)
+                            watched -> Icon(Icons.Default.Check, contentDescription = "Watched", tint = colors.primary)
                             number != null -> Text("$number", style = MaterialTheme.typography.titleMedium, color = colors.onSurfaceVariant)
                             else -> Icon(Icons.Default.PlayArrow, contentDescription = null, tint = colors.onSurfaceVariant)
                         }
@@ -533,13 +541,13 @@ private fun EpisodeStill(video: LibraryEpisode, number: Int?, upNext: Boolean, m
                 Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.padding(5.dp).size(20.dp))
             }
         }
-        if (video.watched) {
-            Surface(
-                shape = CircleShape,
-                color = colors.primary,
-                contentColor = colors.onPrimary,
-                modifier = Modifier.align(Alignment.TopEnd).padding(5.dp),
-            ) {
+        AnimatedVisibility(
+            visible = video.watched,
+            enter = PopIn,
+            exit = PopOut,
+            modifier = Modifier.align(Alignment.TopEnd).padding(5.dp),
+        ) {
+            Surface(shape = CircleShape, color = colors.primary, contentColor = colors.onPrimary) {
                 Icon(Icons.Default.Check, contentDescription = "Watched", modifier = Modifier.padding(2.dp).size(13.dp))
             }
         }

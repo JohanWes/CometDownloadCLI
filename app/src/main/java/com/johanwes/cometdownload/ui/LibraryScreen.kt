@@ -446,13 +446,14 @@ private fun PosterCard(
                 modifier = Modifier.fillMaxWidth().sharedPoster(libraryPosterKey(title)),
                 iconSize = 32.dp,
             )
-            if (title.allWatched) {
-                Surface(
-                    shape = CircleShape,
-                    color = colors.primary,
-                    contentColor = colors.onPrimary,
-                    modifier = Modifier.align(Alignment.TopEnd).padding(6.dp),
-                ) {
+            // Named in full: inside the card's column, the plain name means the column's own variant.
+            androidx.compose.animation.AnimatedVisibility(
+                visible = title.allWatched,
+                enter = PopIn,
+                exit = PopOut,
+                modifier = Modifier.align(Alignment.TopEnd).padding(6.dp),
+            ) {
+                Surface(shape = CircleShape, color = colors.primary, contentColor = colors.onPrimary) {
                     Icon(Icons.Default.Check, contentDescription = "Watched", modifier = Modifier.padding(2.dp).size(14.dp))
                 }
             }
@@ -652,7 +653,7 @@ internal fun DownloadRow(
             if (job.isActive) {
                 if (progress != null && job.state == JobState.Downloading) {
                     LinearProgressIndicator(
-                        progress = { progress },
+                        progress = glide(progress),
                         strokeCap = StrokeCap.Round,
                         gapSize = 0.dp,
                         drawStopIndicator = {},
