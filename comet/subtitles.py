@@ -632,7 +632,17 @@ def embedded_subtitle_summary(paths: list[Path]) -> list[str]:
 
 
 SUBTITLE_VIDEO_EXTENSIONS = (".mkv", ".mp4", ".avi", ".m4v", ".ts", ".mov", ".wmv", ".webm", ".mpg", ".mpeg")
-SEASON_EPISODE_FILENAME = re.compile(r"\bS(\d{1,2})[ ._-]?E(\d{1,3})\b|\b(\d{1,2})x(\d{1,3})\b", re.IGNORECASE)
+# S01E02, 1x02, and season packs that drop the E: "S01 02", "S01.02", "S01 - 02". The episode
+# must not run on into letters or digits, so "S01 720p" or "S01.2008" is not read as an
+# episode. Guards instead of \b so underscores ("Show_S01E02") still count as separators.
+SEASON_EPISODE_FILENAME = re.compile(
+    r"(?<![a-z0-9])(?:"
+    r"S(\d{1,2})[ ._-]?E(\d{1,3})(?:-?E\d{1,3})*"  # S01E02, S01E02E03
+    r"|(\d{1,2})x(\d{1,3})"  # 1x02
+    r"|S(\d{1,2})(?:[ ._]| ?- ?)(\d{1,3})"  # S01 02, S01.02, S01 - 02
+    r")(?![a-z0-9])",
+    re.IGNORECASE,
+)
 
 
 def episode_number_from_filename(path: Path) -> int | None:
@@ -647,6 +657,6 @@ def season_episode_from_filename(path: Path) -> tuple[int | None, int | None]:
     match = SEASON_EPISODE_FILENAME.search(path.name)
     if not match:
         return None, None
-    season = match.group(1) or match.group(3)
-    episode = match.group(2) or match.group(4)
+    season = match.group(1) or match.group(3) or match.group(5)
+    episode = match.group(2) or match.group(4) or match.group(6)
     return int(season), int(episode)
