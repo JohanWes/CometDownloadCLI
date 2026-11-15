@@ -108,6 +108,7 @@ fun LibraryTitleScreen(viewModel: CometViewModel, title: LibraryTitle, paneColor
                     backdropHeight = backdropHeight,
                     paneColor = paneColor,
                     poster = title.poster,
+                    posterKey = libraryPosterKey(title),
                 )
             }
             item(key = "play") {

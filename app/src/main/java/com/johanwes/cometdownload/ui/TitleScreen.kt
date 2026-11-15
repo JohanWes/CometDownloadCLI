@@ -154,7 +154,13 @@ fun TitleScreen(viewModel: CometViewModel, media: MediaItem, embedded: Boolean, 
             modifier = Modifier.fillMaxSize(),
         ) {
             item(key = "header") {
-                TitleHeader(media = media, details = details, backdropHeight = backdropHeight, paneColor = paneColor)
+                TitleHeader(
+                    media = media,
+                    details = details,
+                    backdropHeight = backdropHeight,
+                    paneColor = paneColor,
+                    posterKey = searchPosterKey(media),
+                )
             }
             if (inLibrary != null) {
                 item(key = "in-library") {
@@ -209,6 +215,8 @@ internal fun TitleHeader(
     backdropHeight: Dp,
     paneColor: Color,
     poster: String = media.poster.ifBlank { details?.poster.orEmpty() },
+    /** Names the poster where it travels here from the list the page was opened in. */
+    posterKey: Any? = null,
 ) {
     val colors = MaterialTheme.colorScheme
     Column {
@@ -250,6 +258,7 @@ internal fun TitleHeader(
                     iconSize = 36.dp,
                     modifier = Modifier
                         .width(112.dp)
+                        .sharedPoster(posterKey)
                         .shadow(12.dp, MaterialTheme.shapes.small),
                 )
                 Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(6.dp)) {

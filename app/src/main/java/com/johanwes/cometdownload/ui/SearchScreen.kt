@@ -1,6 +1,5 @@
 package com.johanwes.cometdownload.ui
 
-import androidx.compose.animation.AnimatedContent
 import androidx.compose.ui.focus.focusRequester
 import androidx.compose.ui.focus.FocusRequester
 import androidx.compose.runtime.remember
@@ -11,11 +10,6 @@ import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.clickable
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
-import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.PaddingValues
@@ -121,16 +115,7 @@ fun SearchScreen(
             }
         }
     } else {
-        AnimatedContent(
-            targetState = viewModel.selected,
-            contentKey = { it != null },
-            transitionSpec = {
-                val forward = targetState != null
-                (slideInHorizontally { if (forward) it / 4 else -it / 4 } + fadeIn()) togetherWith
-                    (slideOutHorizontally { if (forward) -it / 4 else it / 4 } + fadeOut())
-            },
-            label = "search-detail",
-        ) { media ->
+        DetailSwitch(state = viewModel.selected, isDetail = { it != null }, label = "search-detail") { media ->
             if (media == null) {
                 ResultsPane(
                     viewModel = viewModel,
@@ -294,6 +279,9 @@ private fun SearchField(
     }
 }
 
+/** Names a result's poster, in the list and on its page, so it can travel between the two. */
+internal fun searchPosterKey(media: MediaItem): String = "search-${media.imdbId}-${media.isSeries}"
+
 @Composable
 private fun MediaRow(media: MediaItem, inLibrary: Boolean, selected: Boolean, showChevron: Boolean, onClick: () -> Unit) {
     Surface(
@@ -307,7 +295,11 @@ private fun MediaRow(media: MediaItem, inLibrary: Boolean, selected: Boolean, sh
             verticalAlignment = Alignment.CenterVertically,
             horizontalArrangement = Arrangement.spacedBy(16.dp),
         ) {
-            Poster(url = media.poster, isSeries = media.isSeries, modifier = Modifier.width(56.dp))
+            Poster(
+                url = media.poster,
+                isSeries = media.isSeries,
+                modifier = Modifier.width(56.dp).sharedPoster(searchPosterKey(media)),
+            )
             Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(4.dp)) {
                 Text(
                     media.title,

@@ -1,12 +1,6 @@
 package com.johanwes.cometdownload.ui
 
 import android.content.Context
-import androidx.compose.animation.AnimatedContent
-import androidx.compose.animation.fadeIn
-import androidx.compose.animation.fadeOut
-import androidx.compose.animation.slideInHorizontally
-import androidx.compose.animation.slideOutHorizontally
-import androidx.compose.animation.togetherWith
 import androidx.compose.foundation.ExperimentalFoundationApi
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
@@ -116,15 +110,7 @@ fun LibraryScreen(viewModel: CometViewModel, showSettingsAction: Boolean, gridSt
     // The page that slides out still needs its title after it was closed (or deleted).
     var shown by remember { mutableStateOf(open) }
     if (open != null) shown = open
-    AnimatedContent(
-        targetState = open != null,
-        transitionSpec = {
-            val forward = targetState
-            (slideInHorizontally { if (forward) it / 4 else -it / 4 } + fadeIn()) togetherWith
-                (slideOutHorizontally { if (forward) -it / 4 else it / 4 } + fadeOut())
-        },
-        label = "library-detail",
-    ) { detail ->
+    DetailSwitch(state = open != null, isDetail = { it }, label = "library-detail") { detail ->
         val title = shown
         if (detail && title != null) {
             // Fresh scroll position and season choice per title.
@@ -327,6 +313,9 @@ private fun LibraryFront(viewModel: CometViewModel, showSettingsAction: Boolean,
     ConfirmDialog(pending) { pending = null }
 }
 
+/** Names a title's poster, in the grid and on its page, so it can travel between the two. */
+internal fun libraryPosterKey(title: LibraryTitle): String = "library-${title.key}"
+
 /** "The Bear" sorts under B. */
 private fun sortName(name: String): String =
     name.lowercase().removePrefix("the ").removePrefix("a ").removePrefix("an ")
@@ -457,7 +446,12 @@ private fun PosterCard(
         // Clipped as a whole, so the progress bar follows the poster's rounded corners.
         Box(Modifier.clip(MaterialTheme.shapes.small)) {
             // No rating here: it helped pick the title in search; on your own shelf it is in the way.
-            Poster(url = title.poster, isSeries = title.isSeries, modifier = Modifier.fillMaxWidth(), iconSize = 32.dp)
+            Poster(
+                url = title.poster,
+                isSeries = title.isSeries,
+                modifier = Modifier.fillMaxWidth().sharedPoster(libraryPosterKey(title)),
+                iconSize = 32.dp,
+            )
             if (title.allWatched) {
                 Surface(
                     shape = CircleShape,
