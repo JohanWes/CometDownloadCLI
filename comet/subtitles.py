@@ -22,7 +22,7 @@ STREMIO_ADDON_URL = "https://opensubtitles-v3.strem.io/subtitles"
 # Serves a subtitle file by its id as UTF-8, without the ad the legacy links add.
 STREMIO_DOWNLOAD_URL = "https://subs5.strem.io/en/download/subencoding-stremio-utf8/src-api/file"
 LEGACY_DOWNLOAD_URL = "https://dl.opensubtitles.org/en/download/file"
-SUBTITLE_USER_AGENT = "CometDownloadCLI v1.0.1"
+SUBTITLE_USER_AGENT = "CometDownloadCLI v1.0.2"
 
 
 DEFAULT_SUBTITLE_LANGUAGES: tuple[str, ...] = ("en", "sv")

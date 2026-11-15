@@ -31,6 +31,9 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.NavigationBar
+import com.johanwes.cometdownload.update.AppUpdater
+import androidx.compose.material.icons.filled.SystemUpdate
+import androidx.compose.material.icons.outlined.SystemUpdate
 import androidx.compose.material3.NavigationBarItem
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
@@ -77,6 +80,11 @@ fun CometApp(viewModel: CometViewModel, onExit: () -> Unit) {
         }
 
         val context = LocalContext.current
+        // Looks for a new version when the app comes to the front (at most every few hours).
+        LifecycleStartEffect(Unit) {
+            AppUpdater.check(context)
+            onStopOrDispose { }
+        }
         LaunchedEffect(viewModel) {
             viewModel.messages.collect { message ->
                 // A new message replaces the current one instead of queueing behind it.
@@ -103,7 +111,7 @@ fun CometApp(viewModel: CometViewModel, onExit: () -> Unit) {
         BackHandler {
             when {
                 viewModel.tab == Tab.Library && viewModel.openTitle != null -> viewModel.openTitle(null)
-                viewModel.tab == Tab.Library -> viewModel.tab = Tab.Search
+                viewModel.tab == Tab.Library || viewModel.tab == Tab.Update -> viewModel.tab = Tab.Search
                 !twoPane && viewModel.selected != null -> viewModel.select(null)
                 else -> onExit()
             }
@@ -181,6 +189,10 @@ fun CometApp(viewModel: CometViewModel, onExit: () -> Unit) {
                                 showSettingsAction = !useRail,
                                 gridState = libraryGridState,
                             )
+                            Tab.Update -> UpdateScreen(
+                                showSettingsAction = !useRail,
+                                onSettings = viewModel::openSettings,
+                            )
                         }
                     }
                 }
@@ -215,6 +227,7 @@ private data class Destination(
 private val Destinations = listOf(
     Destination(Tab.Search, "Search", Icons.Outlined.Search, Icons.Filled.Search),
     Destination(Tab.Library, "Library", Icons.Outlined.VideoLibrary, Icons.Filled.VideoLibrary),
+    Destination(Tab.Update, "Update", Icons.Outlined.SystemUpdate, Icons.Filled.SystemUpdate),
 )
 
 @Composable
@@ -231,6 +244,11 @@ private fun DestinationIcon(destination: Destination, selected: Boolean, activeC
             },
         ) {
             Icon(icon, contentDescription = null)
+        }
+    } else if (destination.tab == Tab.Update && AppUpdater.hasUpdate) {
+        // A plain dot: a newer version is waiting.
+        BadgedBox(badge = { Badge(containerColor = UpdateYellow) }) {
+            Icon(icon, contentDescription = "Update available")
         }
     } else {
         Icon(icon, contentDescription = null)

@@ -16,6 +16,7 @@ Download the APK from the [latest release](https://github.com/JohanWes/CometDown
 
 - **Search**: movies, single episodes or full seasons, in 4K or 1080p. Files go to the phone's `Download` folder and keep downloading in the background.
 - **Library**: poster grid of what you have downloaded, with progress, next episode and watched marks. Works offline.
+- **Update**: the Update tab shows a dot when a newer release is on GitHub and installs it over the current version, keeping settings and library.
 - **Player**: built in (Media3 with FFmpeg decoders, so DTS and TrueHD play). Subtitle and audio track choice, more subtitles from OpenSubtitles while watching, chapters, speed, and gestures for seek, brightness and volume.
 
 Build it yourself with `./gradlew :app:installDebug` (Android SDK with platform 36).

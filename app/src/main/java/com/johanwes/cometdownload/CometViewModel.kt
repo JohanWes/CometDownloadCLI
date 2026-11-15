@@ -36,7 +36,7 @@ sealed interface Load<out T> {
     data class Failed(val message: String) : Load<Nothing>
 }
 
-enum class Tab { Search, Library }
+enum class Tab { Search, Library, Update }
 
 enum class MessageAction { None, ViewLibrary, StorageAccess }
 

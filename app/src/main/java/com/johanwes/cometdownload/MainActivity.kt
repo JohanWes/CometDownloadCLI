@@ -17,6 +17,7 @@ import androidx.activity.viewModels
 import androidx.core.app.ActivityCompat
 import androidx.core.content.ContextCompat
 import com.johanwes.cometdownload.ui.CometApp
+import com.johanwes.cometdownload.update.UpdateReceiver
 
 class MainActivity : ComponentActivity() {
     private val viewModel: CometViewModel by viewModels()
@@ -47,6 +48,7 @@ class MainActivity : ComponentActivity() {
         super.onResume()
         // The user may have just come back from the "All files access" settings page.
         viewModel.refreshStorageAccess()
+        UpdateReceiver.dismissUpdatedNotice(this)
     }
 
     private fun handleIntent(intent: Intent?) {
