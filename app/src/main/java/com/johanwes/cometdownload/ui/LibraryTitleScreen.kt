@@ -22,7 +22,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.layout.windowInsetsBottomHeight
 import androidx.compose.foundation.lazy.LazyColumn
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
@@ -37,7 +36,6 @@ import androidx.compose.material3.Button
 import androidx.compose.material3.ButtonDefaults
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
@@ -341,23 +339,15 @@ private fun SeasonBar(
             modifier = Modifier.padding(horizontal = 16.dp),
         )
         if (seasons.size > 1) {
-            val chipState = rememberLazyListState(
-                initialFirstVisibleItemIndex = (seasons.indexOf(season) - 1).coerceAtLeast(0),
-            )
-            LazyRow(
-                state = chipState,
+            PillChips(
+                options = seasons,
+                selected = season,
+                onSelect = onPick,
+                label = ::seasonName,
+                scrollable = true,
                 contentPadding = PaddingValues(horizontal = 16.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
                 modifier = Modifier.padding(top = 8.dp),
-            ) {
-                items(seasons, key = { it }) { option ->
-                    FilterChip(
-                        selected = option == season,
-                        onClick = { onPick(option) },
-                        label = { Text(seasonName(option)) },
-                    )
-                }
-            }
+            )
         }
         Row(
             Modifier.padding(start = 20.dp, end = 4.dp, top = 4.dp),

@@ -47,7 +47,6 @@ import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.LinearProgressIndicator
@@ -279,18 +278,13 @@ private fun LibraryFront(viewModel: CometViewModel, showSettingsAction: Boolean,
             if (library.isNotEmpty()) {
                 item(key = "titles-label", span = fullWidth) {
                     if (bothKinds) {
-                        Row(
-                            Modifier.padding(top = 8.dp),
-                            horizontalArrangement = Arrangement.spacedBy(8.dp),
-                        ) {
-                            LibraryFilter.entries.forEach { option ->
-                                FilterChip(
-                                    selected = filter == option,
-                                    onClick = { viewModel.libraryFilter = option },
-                                    label = { Text(option.label) },
-                                )
-                            }
-                        }
+                        PillChips(
+                            options = LibraryFilter.entries,
+                            selected = filter,
+                            onSelect = { viewModel.libraryFilter = it },
+                            label = { it.label },
+                            modifier = Modifier.padding(top = 8.dp),
+                        )
                     } else {
                         SectionLabel(if (library.first().isSeries) "Series" else "Movies")
                     }

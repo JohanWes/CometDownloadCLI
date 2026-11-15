@@ -6,6 +6,7 @@ import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -36,8 +37,10 @@ import com.johanwes.cometdownload.update.AppUpdater
 import androidx.compose.material.icons.filled.SystemUpdate
 import androidx.compose.material.icons.outlined.SystemUpdate
 import androidx.compose.material3.NavigationBarItem
+import androidx.compose.material3.NavigationBarItemDefaults
 import androidx.compose.material3.NavigationRail
 import androidx.compose.material3.NavigationRailItem
+import androidx.compose.material3.NavigationRailItemDefaults
 import androidx.compose.material3.Scaffold
 import androidx.compose.material3.SnackbarDuration
 import androidx.compose.material3.SnackbarHost
@@ -52,10 +55,12 @@ import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.unit.DpSize
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.LifecycleStartEffect
 import com.johanwes.cometdownload.CometViewModel
@@ -68,6 +73,10 @@ import kotlinx.coroutines.launch
 private const val RAIL_MIN_WIDTH_DP = 600
 private const val TWO_PANE_MIN_WIDTH_DP = 720
 private const val FLIGHT_GRACE_MS = 200L
+
+// Material's sizes for the selected tab's indicator.
+private val BarPillSize = DpSize(64.dp, 32.dp)
+private val RailPillSize = DpSize(56.dp, 32.dp)
 private const val FLIGHT_RECENT_MS = 1000L
 
 @Composable
@@ -148,7 +157,13 @@ fun CometApp(viewModel: CometViewModel, onExit: () -> Unit) {
             },
             bottomBar = {
                 if (!useRail) {
-                    NavigationBar(containerColor = MaterialTheme.colorScheme.surfaceContainer) {
+                    // One pill that glides between the tabs stands in for each item's own.
+                    NavigationBar(
+                        containerColor = Color.Transparent,
+                        modifier = Modifier
+                            .background(MaterialTheme.colorScheme.surfaceContainer)
+                            .tabPill(viewModel.tab, BarPillSize, MaterialTheme.colorScheme.secondaryContainer),
+                    ) {
                         Destinations.forEach { destination ->
                             val selected = viewModel.tab == destination.tab
                             NavigationBarItem(
@@ -156,6 +171,7 @@ fun CometApp(viewModel: CometViewModel, onExit: () -> Unit) {
                                 onClick = { viewModel.goTo(destination.tab) },
                                 icon = { DestinationIcon(destination, selected, activeCount) },
                                 label = { Text(destination.label) },
+                                colors = NavigationBarItemDefaults.colors(indicatorColor = Color.Transparent),
                             )
                         }
                     }
@@ -169,7 +185,12 @@ fun CometApp(viewModel: CometViewModel, onExit: () -> Unit) {
                     .consumeWindowInsets(padding),
             ) {
                 if (useRail) {
-                    NavigationRail(containerColor = MaterialTheme.colorScheme.surfaceContainer) {
+                    NavigationRail(
+                        containerColor = Color.Transparent,
+                        modifier = Modifier
+                            .background(MaterialTheme.colorScheme.surfaceContainer)
+                            .tabPill(viewModel.tab, RailPillSize, MaterialTheme.colorScheme.secondaryContainer),
+                    ) {
                         Spacer(Modifier.height(12.dp))
                         Destinations.forEach { destination ->
                             val selected = viewModel.tab == destination.tab
@@ -178,6 +199,7 @@ fun CometApp(viewModel: CometViewModel, onExit: () -> Unit) {
                                 onClick = { viewModel.goTo(destination.tab) },
                                 icon = { DestinationIcon(destination, selected, activeCount) },
                                 label = { Text(destination.label) },
+                                colors = NavigationRailItemDefaults.colors(indicatorColor = Color.Transparent),
                             )
                         }
                         Spacer(Modifier.weight(1f))

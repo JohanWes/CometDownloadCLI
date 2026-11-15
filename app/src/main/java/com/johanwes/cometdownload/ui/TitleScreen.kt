@@ -37,7 +37,6 @@ import androidx.compose.foundation.layout.windowInsetsBottomHeight
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
 import androidx.compose.foundation.lazy.LazyListState
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.material.icons.Icons
@@ -54,7 +53,6 @@ import androidx.compose.material.icons.outlined.ErrorOutline
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.FilledTonalIconButton
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.IconButtonDefaults
@@ -467,22 +465,14 @@ private fun SeasonEpisodePicker(
     val episodes = details.episodesIn(scope.season)
     Column(Modifier.padding(top = 16.dp), verticalArrangement = Arrangement.spacedBy(8.dp)) {
         if (seasons.size > 1) {
-            val seasonListState = rememberLazyListState(
-                initialFirstVisibleItemIndex = (seasons.indexOf(scope.season) - 1).coerceAtLeast(0),
-            )
-            LazyRow(
-                state = seasonListState,
+            PillChips(
+                options = seasons,
+                selected = scope.season,
+                onSelect = { onChange(EpisodeScope(season = it, episode = 0), 0) },
+                label = { "Season $it" },
+                scrollable = true,
                 contentPadding = PaddingValues(horizontal = 16.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp),
-            ) {
-                items(seasons, key = { it }) { season ->
-                    FilterChip(
-                        selected = scope.season == season,
-                        onClick = { onChange(EpisodeScope(season = season, episode = 0), 0) },
-                        label = { Text("Season $season") },
-                    )
-                }
-            }
+            )
         }
         EpisodeField(
             label = if (seasons.size > 1) "Episode" else "Season ${scope.season} · Episode",

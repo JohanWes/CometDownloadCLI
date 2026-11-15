@@ -34,7 +34,6 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
-import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -49,7 +48,6 @@ import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material3.CircularProgressIndicator
-import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
@@ -79,6 +77,7 @@ import com.johanwes.cometdownload.player.NamedColor
 import com.johanwes.cometdownload.player.PlayerViewModel
 import com.johanwes.cometdownload.player.SubtitleSelection
 import com.johanwes.cometdownload.player.SubtitleStyle
+import com.johanwes.cometdownload.ui.PillChips
 import com.johanwes.cometdownload.ui.Stepper
 import com.johanwes.cometdownload.ui.Tag
 import kotlinx.coroutines.delay
@@ -292,25 +291,16 @@ fun SubtitlesPanel(viewModel: PlayerViewModel, styling: Boolean, onStyling: (Boo
         item(key = "online") { SectionLabel("More from OpenSubtitles") }
         if (viewModel.languages.isNotEmpty()) {
             item(key = "languages") {
-                LazyRow(
+                // The blank code stands for the languages picked in the settings.
+                val names = viewModel.languages.associate { it.code to it.name }
+                PillChips(
+                    options = listOf("") + viewModel.languages.map { it.code },
+                    selected = viewModel.searchLanguage,
+                    onSelect = viewModel::searchOnline,
+                    label = { code -> names[code] ?: "Preferred" },
+                    scrollable = true,
                     contentPadding = PaddingValues(horizontal = 16.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp),
-                ) {
-                    item(key = "") {
-                        FilterChip(
-                            selected = viewModel.searchLanguage.isBlank(),
-                            onClick = { viewModel.searchOnline("") },
-                            label = { Text("Preferred") },
-                        )
-                    }
-                    items(viewModel.languages, key = { it.code }) { language ->
-                        FilterChip(
-                            selected = viewModel.searchLanguage == language.code,
-                            onClick = { viewModel.searchOnline(language.code) },
-                            label = { Text(language.name) },
-                        )
-                    }
-                }
+                )
             }
         }
         when (val online = viewModel.online) {
