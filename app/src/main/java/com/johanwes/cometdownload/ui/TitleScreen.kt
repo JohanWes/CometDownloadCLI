@@ -74,11 +74,11 @@ import androidx.compose.ui.BiasAlignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
 import androidx.compose.ui.draw.drawWithContent
-import androidx.compose.ui.geometry.Offset
-import androidx.compose.ui.geometry.Size
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.CompositingStrategy
 import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalDensity
@@ -147,6 +147,11 @@ fun TitleScreen(viewModel: CometViewModel, media: MediaItem, embedded: Boolean, 
     val inLibrary = viewModel.libraryTitle(media)
 
     Box(Modifier.fillMaxSize()) {
+        ArtworkWash(
+            url = media.poster.ifBlank { details?.poster.orEmpty() },
+            paneColor = paneColor,
+            plainTop = statusTop + TopBarHeight,
+        )
         LazyColumn(
             state = listState,
             verticalArrangement = Arrangement.spacedBy(8.dp),
@@ -158,7 +163,6 @@ fun TitleScreen(viewModel: CometViewModel, media: MediaItem, embedded: Boolean, 
                     media = media,
                     details = details,
                     backdropHeight = backdropHeight,
-                    paneColor = paneColor,
                     posterKey = searchPosterKey(media),
                 )
             }
@@ -213,7 +217,6 @@ internal fun TitleHeader(
     media: MediaItem,
     details: MediaDetails?,
     backdropHeight: Dp,
-    paneColor: Color,
     poster: String = media.poster.ifBlank { details?.poster.orEmpty() },
     /** Names the poster where it travels here from the list the page was opened in. */
     posterKey: Any? = null,
@@ -222,13 +225,13 @@ internal fun TitleHeader(
     Column {
         Box(Modifier.fillMaxWidth()) {
             val background = details?.background.orEmpty()
-            // Darken the top for the bar icons and fade the bottom into the page. Drawn on the
-            // same node as the image (plus a solid 2px band) so no image row can peek out below.
-            val fade = Brush.verticalGradient(
-                0f to Color.Black.copy(alpha = 0.6f),
-                0.3f to Color.Transparent,
-                0.55f to paneColor.copy(alpha = 0.5f),
-                1f to paneColor,
+            // Darken the top for the bar icons, and let the bottom dissolve into the page: it is
+            // faded out rather than painted over, because the page behind it is not one colour.
+            val shade = Brush.verticalGradient(0f to Color.Black.copy(alpha = 0.6f), 0.3f to Color.Transparent)
+            val dissolve = Brush.verticalGradient(
+                0.3f to Color.Black,
+                0.55f to Color.Black.copy(alpha = 0.5f),
+                1f to Color.Transparent,
             )
             Box(
                 Modifier
@@ -236,10 +239,11 @@ internal fun TitleHeader(
                     .height(backdropHeight)
                     // Crop scaling overflows the box on wide panes; keep it inside.
                     .clipToBounds()
+                    .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
                     .drawWithContent {
                         drawContent()
-                        drawRect(fade)
-                        drawRect(paneColor, topLeft = Offset(0f, size.height - 2f), size = Size(size.width, 2f))
+                        drawRect(shade)
+                        drawRect(dissolve, blendMode = BlendMode.DstIn)
                     },
             ) {
                 if (background.isNotBlank()) {
@@ -408,7 +412,8 @@ private fun InLibraryRow(title: LibraryTitle, onOpen: () -> Unit, modifier: Modi
     val colors = MaterialTheme.colorScheme
     Surface(
         onClick = onOpen,
-        color = colors.surfaceContainer,
+        color = glassFill(),
+        border = glassRim(),
         shape = MaterialTheme.shapes.medium,
         modifier = modifier.fillMaxWidth(),
     ) {
@@ -638,7 +643,7 @@ private fun EpisodeRow(
 
 @Composable
 private fun EpisodeStepper(scope: EpisodeScope, onChange: (EpisodeScope) -> Unit, modifier: Modifier = Modifier) {
-    Surface(color = MaterialTheme.colorScheme.surfaceContainer, shape = MaterialTheme.shapes.large, modifier = modifier) {
+    Surface(color = glassFill(), border = glassRim(), shape = MaterialTheme.shapes.large, modifier = modifier) {
         Column(Modifier.fillMaxWidth().padding(16.dp), verticalArrangement = Arrangement.spacedBy(12.dp)) {
             Row(horizontalArrangement = Arrangement.spacedBy(24.dp)) {
                 Stepper(
@@ -804,7 +809,6 @@ private fun StreamRow(
     // Uncached streams are a gamble (the debrid service has to fetch them first), so they
     // sit visually behind the cached ones. So does what there is no room for.
     val prominent = stream.cached && !tooBig
-    val container = if (prominent) colors.surfaceContainer else colors.surfaceContainerLow
     val sizeColor = if (prominent) colors.onSurface else colors.onSurfaceVariant
     // Once the download is really in the list, a dot flies from the button to the Library tab.
     val flight = LocalDownloadFlight.current
@@ -820,7 +824,12 @@ private fun StreamRow(
             wasQueueing = false
         }
     }
-    Surface(color = container, shape = MaterialTheme.shapes.medium, modifier = modifier.fillMaxWidth()) {
+    Surface(
+        color = glassFill(prominent),
+        border = glassRim(prominent),
+        shape = MaterialTheme.shapes.medium,
+        modifier = modifier.fillMaxWidth(),
+    ) {
         Column {
             Row(
                 modifier = Modifier.padding(start = 16.dp, end = 8.dp, top = 12.dp, bottom = 12.dp),

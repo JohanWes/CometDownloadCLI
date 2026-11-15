@@ -79,6 +79,7 @@ import com.johanwes.cometdownload.player.SubtitleSelection
 import com.johanwes.cometdownload.player.SubtitleStyle
 import com.johanwes.cometdownload.ui.PillChips
 import com.johanwes.cometdownload.ui.Stepper
+import com.johanwes.cometdownload.ui.glassRim
 import com.johanwes.cometdownload.ui.Tag
 import kotlinx.coroutines.delay
 import kotlin.math.roundToInt
@@ -118,8 +119,11 @@ fun PanelHost(
             modifier = Modifier.align(if (landscape) Alignment.CenterEnd else Alignment.BottomCenter),
         ) {
             Surface(
+                // As good as solid: what plays behind it can't be blurred, and a moving picture
+                // showing through would make the lists hard to read. The rim alone says "glass".
                 color = MaterialTheme.colorScheme.surfaceContainer.copy(alpha = 0.96f),
                 contentColor = MaterialTheme.colorScheme.onSurface,
+                border = glassRim(),
                 shape = if (landscape) {
                     RoundedCornerShape(topStart = 24.dp, bottomStart = 24.dp)
                 } else {

@@ -79,6 +79,20 @@ fun LoadingState(label: String, modifier: Modifier = Modifier) {
     }
 }
 
+/**
+ * The fill of a card that lies on a title page's artwork wash: see-through, so the colours
+ * behind it come along, where a solid colour would cut a hole in them. Cards that should sit
+ * back (not [prominent]) get less of it.
+ */
+@Composable
+fun glassFill(prominent: Boolean = true): Color =
+    MaterialTheme.colorScheme.onSurface.copy(alpha = if (prominent) 0.07f else 0.035f)
+
+/** The thin rim that goes with [glassFill]. */
+@Composable
+fun glassRim(prominent: Boolean = true): BorderStroke =
+    BorderStroke(1.dp, MaterialTheme.colorScheme.onSurface.copy(alpha = if (prominent) 0.10f else 0.05f))
+
 /** Small rounded label, e.g. "Cached" or "Subtitles". */
 @Composable
 fun Tag(

@@ -96,6 +96,7 @@ fun LibraryTitleScreen(viewModel: CometViewModel, title: LibraryTitle, paneColor
     val next = title.nextUp
 
     Box(Modifier.fillMaxSize()) {
+        ArtworkWash(url = title.poster, paneColor = paneColor, plainTop = statusTop + TopBarHeight)
         LazyColumn(
             state = listState,
             contentPadding = PaddingValues(bottom = 16.dp),
@@ -106,7 +107,6 @@ fun LibraryTitleScreen(viewModel: CometViewModel, title: LibraryTitle, paneColor
                     media = title.media,
                     details = title.details,
                     backdropHeight = backdropHeight,
-                    paneColor = paneColor,
                     poster = title.poster,
                     posterKey = libraryPosterKey(title),
                 )
@@ -413,7 +413,8 @@ private fun VideoRow(
     Surface(
         onClick = onPlay,
         // What plays next stands out, so the place in a season is found at a glance.
-        color = if (highlighted) colors.surfaceContainer else Color.Transparent,
+        color = if (highlighted) glassFill() else Color.Transparent,
+        border = if (highlighted) glassRim() else null,
         shape = MaterialTheme.shapes.medium,
         modifier = modifier.fillMaxWidth(),
     ) {
@@ -559,7 +560,12 @@ private fun EpisodeStill(video: LibraryEpisode, number: Int?, upNext: Boolean, m
 @Composable
 private fun FilesCard(job: JobItem, onSubtitles: ((tryAnother: Boolean) -> Unit)?, modifier: Modifier = Modifier) {
     val colors = MaterialTheme.colorScheme
-    Surface(color = colors.surfaceContainerLow, shape = MaterialTheme.shapes.medium, modifier = modifier.fillMaxWidth()) {
+    Surface(
+        color = glassFill(prominent = false),
+        border = glassRim(prominent = false),
+        shape = MaterialTheme.shapes.medium,
+        modifier = modifier.fillMaxWidth(),
+    ) {
         Column(Modifier.padding(start = 16.dp, end = 16.dp, top = 12.dp, bottom = 8.dp), verticalArrangement = Arrangement.spacedBy(6.dp)) {
             Text(
                 job.label,

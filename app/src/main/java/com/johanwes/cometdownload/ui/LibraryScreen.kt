@@ -611,7 +611,7 @@ internal fun DownloadRow(
 ) {
     val colors = MaterialTheme.colorScheme
     val progress = job.overallProgress
-    Surface(color = colors.surfaceContainer, shape = MaterialTheme.shapes.medium, modifier = modifier.fillMaxWidth()) {
+    Surface(color = glassFill(), border = glassRim(), shape = MaterialTheme.shapes.medium, modifier = modifier.fillMaxWidth()) {
         Column(Modifier.padding(12.dp), verticalArrangement = Arrangement.spacedBy(10.dp)) {
             Row(verticalAlignment = Alignment.CenterVertically, horizontalArrangement = Arrangement.spacedBy(12.dp)) {
                 Poster(
