@@ -2,6 +2,7 @@ package com.johanwes.cometdownload.ui
 
 import androidx.activity.compose.BackHandler
 import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.core.Animatable
 import androidx.compose.animation.Crossfade
 import androidx.compose.animation.fadeIn
 import androidx.compose.animation.fadeOut
@@ -44,9 +45,14 @@ import androidx.compose.material3.SnackbarHostState
 import androidx.compose.material3.SnackbarResult
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.CompositionLocalProvider
 import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.graphics.graphicsLayer
 import androidx.compose.ui.graphics.vector.ImageVector
 import androidx.compose.ui.platform.LocalConfiguration
 import androidx.compose.ui.platform.LocalContext
@@ -56,10 +62,13 @@ import com.johanwes.cometdownload.CometViewModel
 import com.johanwes.cometdownload.MainActivity
 import com.johanwes.cometdownload.MessageAction
 import com.johanwes.cometdownload.Tab
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.launch
 
 private const val RAIL_MIN_WIDTH_DP = 600
 private const val TWO_PANE_MIN_WIDTH_DP = 720
+private const val FLIGHT_GRACE_MS = 200L
+private const val FLIGHT_RECENT_MS = 1000L
 
 @Composable
 fun CometApp(viewModel: CometViewModel, onExit: () -> Unit) {
@@ -73,6 +82,8 @@ fun CometApp(viewModel: CometViewModel, onExit: () -> Unit) {
         // The list keeps its place while a title is open, but a new search starts at the top.
         LaunchedEffect(viewModel.searchCount) { resultsListState.requestScrollToItem(0) }
         val activeCount = viewModel.jobs.count { it.isActive }
+        val anchors = remember { Anchors() }
+        val flight = remember { DownloadFlight() }
 
         LifecycleStartEffect(viewModel) {
             viewModel.setVisible(true)
@@ -87,9 +98,15 @@ fun CometApp(viewModel: CometViewModel, onExit: () -> Unit) {
         }
         LaunchedEffect(viewModel) {
             viewModel.messages.collect { message ->
-                // A new message replaces the current one instead of queueing behind it.
-                snackbar.currentSnackbarData?.dismiss()
                 launch {
+                    if (message.onlyQueued) {
+                        // The dot that flies to the Library tab has said this already. It sets
+                        // off a moment after the message, so that is waited for.
+                        delay(FLIGHT_GRACE_MS)
+                        if (flight.launchedWithin(FLIGHT_RECENT_MS)) return@launch
+                    }
+                    // A new message replaces the current one instead of queueing behind it.
+                    snackbar.currentSnackbarData?.dismiss()
                     val action = when (message.action) {
                         MessageAction.ViewLibrary -> if (viewModel.tab != Tab.Library) "View" else null
                         MessageAction.StorageAccess -> "Allow"
@@ -118,6 +135,7 @@ fun CometApp(viewModel: CometViewModel, onExit: () -> Unit) {
             }
         }
 
+        CompositionLocalProvider(LocalAnchors provides anchors, LocalDownloadFlight provides flight) {
         Box(Modifier.fillMaxSize()) {
         Scaffold(
             containerColor = MaterialTheme.colorScheme.background,
@@ -214,6 +232,9 @@ fun CometApp(viewModel: CometViewModel, onExit: () -> Unit) {
                 onTestDebrid = viewModel::testDebrid,
             )
         }
+
+        DownloadFlightOverlay(flight, target = anchors[tabAnchor(Tab.Library)])
+        }
         }
     }
 }
@@ -234,27 +255,59 @@ private val Destinations = listOf(
 @Composable
 private fun DestinationIcon(destination: Destination, selected: Boolean, activeCount: Int) {
     val icon = if (selected) destination.selectedIcon else destination.icon
-    // The number of downloads still running.
-    if (destination.tab == Tab.Library && activeCount > 0) {
+    // Where the icon is, for the selection pill and for downloads that fly to the Library tab.
+    val place = Modifier.anchor(LocalAnchors.current, tabAnchor(destination.tab))
+    if (destination.tab == Tab.Library) {
+        LibraryIcon(icon, activeCount, place)
+    } else if (destination.tab == Tab.Update && AppUpdater.hasUpdate) {
+        // A plain dot: a newer version is waiting.
+        BadgedBox(badge = { Badge(containerColor = UpdateYellow) }) {
+            Icon(icon, contentDescription = "Update available", modifier = place)
+        }
+    } else {
+        Icon(icon, contentDescription = null, modifier = place)
+    }
+}
+
+/** The Library icon with the number of downloads still running; the number pops when one is added. */
+@Composable
+private fun LibraryIcon(icon: ImageVector, activeCount: Int, place: Modifier) {
+    val flight = LocalDownloadFlight.current
+    // A download that is still flying here is counted when it lands.
+    var shown by remember { mutableIntStateOf(activeCount) }
+    var seenLandings by remember { mutableIntStateOf(flight.landings) }
+    val pop = remember { Animatable(1f) }
+    LaunchedEffect(activeCount, flight.inFlight, flight.landings) {
+        val landed = flight.landings != seenLandings
+        seenLandings = flight.landings
+        val waitForDot = activeCount > shown && flight.inFlight && !landed
+        if (!waitForDot) {
+            if (activeCount > shown) pop.snapTo(BADGE_POP)
+            shown = activeCount
+        }
+        pop.animateTo(1f, Motion.bouncy())
+    }
+    if (shown > 0) {
         BadgedBox(
             badge = {
                 Badge(
                     containerColor = MaterialTheme.colorScheme.primary,
                     contentColor = MaterialTheme.colorScheme.onPrimary,
-                ) { Text(activeCount.toString()) }
+                    modifier = Modifier.graphicsLayer {
+                        scaleX = pop.value
+                        scaleY = pop.value
+                    },
+                ) { Text(shown.toString()) }
             },
         ) {
-            Icon(icon, contentDescription = null)
-        }
-    } else if (destination.tab == Tab.Update && AppUpdater.hasUpdate) {
-        // A plain dot: a newer version is waiting.
-        BadgedBox(badge = { Badge(containerColor = UpdateYellow) }) {
-            Icon(icon, contentDescription = "Update available")
+            Icon(icon, contentDescription = null, modifier = place)
         }
     } else {
-        Icon(icon, contentDescription = null)
+        Icon(icon, contentDescription = null, modifier = place)
     }
 }
+
+private const val BADGE_POP = 1.5f
 
 /** Settings shortcut for top bars on compact screens (the rail has its own entry). */
 @Composable

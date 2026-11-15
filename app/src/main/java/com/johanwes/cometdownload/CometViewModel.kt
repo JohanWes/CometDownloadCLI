@@ -44,7 +44,12 @@ enum class LibraryFilter(val label: String) { All("All"), Movies("Movies"), Seri
 
 enum class LibrarySort(val label: String) { Recent("Recently added"), Title("Title"), Rating("IMDb rating") }
 
-data class UiMessage(val text: String, val action: MessageAction = MessageAction.None)
+data class UiMessage(
+    val text: String,
+    val action: MessageAction = MessageAction.None,
+    /** Says no more than "it was queued", which the dot flying to the Library tab says too. */
+    val onlyQueued: Boolean = false,
+)
 
 /** Season/episode scope for a series; episode 0 means the whole season. */
 data class EpisodeScope(val season: Int = 1, val episode: Int = 0)
@@ -318,11 +323,12 @@ class CometViewModel(application: Application) : AndroidViewModel(application) {
                 DownloadForegroundService.start(getApplication())
                 refreshJobs()
                 val provider = settings.provider.label
+                val metered = isOnMeteredNetwork()
                 val note = buildString {
                     append(if (stream.cached) "Added to downloads" else "Requested from $provider. It downloads once they have it")
-                    if (isOnMeteredNetwork()) append(" (you're on mobile data)")
+                    if (metered) append(" (you're on mobile data)")
                 }
-                messageChannel.trySend(UiMessage(note, MessageAction.ViewLibrary))
+                messageChannel.trySend(UiMessage(note, MessageAction.ViewLibrary, onlyQueued = stream.cached && !metered))
             }.onFailure {
                 messageChannel.trySend(UiMessage(it.friendlyMessage("Could not queue download.")))
             }

@@ -1,5 +1,6 @@
 package com.johanwes.cometdownload.ui
 
+import androidx.compose.animation.AnimatedContent
 import androidx.compose.animation.animateColorAsState
 import com.johanwes.cometdownload.releaseTags
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -63,6 +64,7 @@ import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
@@ -814,6 +816,20 @@ private fun StreamRow(
     val prominent = stream.cached && !tooBig
     val container = if (prominent) colors.surfaceContainer else colors.surfaceContainerLow
     val sizeColor = if (prominent) colors.onSurface else colors.onSurfaceVariant
+    // Once the download is really in the list, a dot flies from the button to the Library tab.
+    val flight = LocalDownloadFlight.current
+    val actionSpot = rememberSpot()
+    var wasQueueing by remember { mutableStateOf(false) }
+    val queueing = state == StreamState.Queueing
+    val active = job?.isActive == true
+    LaunchedEffect(queueing, active) {
+        if (queueing) {
+            wasQueueing = true
+        } else {
+            if (wasQueueing && active) actionSpot.center?.let(flight::launch)
+            wasQueueing = false
+        }
+    }
     Surface(color = container, shape = MaterialTheme.shapes.medium, modifier = modifier.fillMaxWidth()) {
         Column {
             Row(
@@ -869,7 +885,7 @@ private fun StreamRow(
                         Text("Not enough free space", style = MaterialTheme.typography.labelMedium, color = colors.error)
                     }
                 }
-                Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
+                Box(Modifier.size(48.dp).spot(actionSpot), contentAlignment = Alignment.Center) {
                     StreamAction(stream, state, tooBig, providerLabel, onQueue, onShowDownloads)
                 }
             }
@@ -907,6 +923,9 @@ private fun JobStatusText(job: JobItem) {
     Text(text, style = MaterialTheme.typography.labelMedium, color = color, maxLines = 2, overflow = TextOverflow.Ellipsis)
 }
 
+/** What the button at the end of a stream row is, whatever the job behind it says in detail. */
+private enum class StreamActionKind { Download, TooBig, Request, Queueing, Retry, Waiting, Done, Downloading }
+
 @Composable
 private fun StreamAction(
     stream: StreamItem,
@@ -917,37 +936,52 @@ private fun StreamAction(
     onShowDownloads: () -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
-    when (state) {
-        // Still a button: tapping it says how much is needed and how much is free.
-        StreamState.Ready -> if (tooBig) {
-            IconButton(onClick = onQueue) {
+    val kind = when (state) {
+        StreamState.Ready -> when {
+            tooBig -> StreamActionKind.TooBig
+            stream.cached -> StreamActionKind.Download
+            else -> StreamActionKind.Request
+        }
+        StreamState.Queueing -> StreamActionKind.Queueing
+        is StreamState.Linked -> when {
+            state.job.canRetry -> StreamActionKind.Retry
+            state.job.isWaiting -> StreamActionKind.Waiting
+            state.job.state == JobState.Completed -> StreamActionKind.Done
+            else -> StreamActionKind.Downloading
+        }
+    }
+    AnimatedContent(
+        targetState = kind,
+        transitionSpec = { IconSwap },
+        contentAlignment = Alignment.Center,
+        label = "stream-action",
+    ) { shown ->
+        when (shown) {
+            // Still a button: tapping it says how much is needed and how much is free.
+            StreamActionKind.TooBig -> IconButton(onClick = onQueue) {
                 Icon(
                     Icons.Default.Download,
                     contentDescription = "Download (not enough free space)",
                     tint = colors.onSurfaceVariant.copy(alpha = 0.5f),
                 )
             }
-        } else if (stream.cached) {
-            FilledTonalIconButton(onClick = onQueue) {
+            StreamActionKind.Download -> FilledTonalIconButton(onClick = onQueue) {
                 Icon(Icons.Default.Download, contentDescription = "Download")
             }
-        } else {
-            OutlinedIconButton(onClick = onQueue) {
+            StreamActionKind.Request -> OutlinedIconButton(onClick = onQueue) {
                 Icon(Icons.Outlined.CloudDownload, contentDescription = "Request from $providerLabel")
             }
-        }
-        StreamState.Queueing -> CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
-        is StreamState.Linked -> when {
-            state.job.canRetry -> FilledTonalIconButton(onClick = onQueue) {
+            StreamActionKind.Queueing -> CircularProgressIndicator(Modifier.size(24.dp), strokeWidth = 2.dp)
+            StreamActionKind.Retry -> FilledTonalIconButton(onClick = onQueue) {
                 Icon(Icons.Default.Refresh, contentDescription = "Try again")
             }
-            state.job.isWaiting -> IconButton(onClick = onShowDownloads) {
+            StreamActionKind.Waiting -> IconButton(onClick = onShowDownloads) {
                 Icon(Icons.Outlined.CloudDownload, contentDescription = "Waiting for $providerLabel, show downloads", tint = colors.primary)
             }
-            state.job.state == JobState.Completed -> IconButton(onClick = onShowDownloads) {
+            StreamActionKind.Done -> IconButton(onClick = onShowDownloads) {
                 Icon(Icons.Default.DownloadDone, contentDescription = "Downloaded, show downloads", tint = colors.primary)
             }
-            else -> IconButton(onClick = onShowDownloads) {
+            StreamActionKind.Downloading -> IconButton(onClick = onShowDownloads) {
                 Icon(Icons.Outlined.Downloading, contentDescription = "Downloading, show downloads", tint = colors.primary)
             }
         }
