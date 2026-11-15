@@ -8,21 +8,23 @@ import androidx.security.crypto.MasterKey
 import org.json.JSONObject
 import java.io.File
 
-/** The user's settings (tokens and logins), kept in encrypted preferences. */
+/** The user's settings (the debrid token among them), kept in encrypted preferences. */
 class SettingsStore(context: Context) {
     private val appContext = context.applicationContext
     private val prefs: SharedPreferences = securePrefs(appContext)
 
     init {
         importSeedSettings()
+        // Subtitles used to need an OpenSubtitles account; don't keep its login around.
+        if (LEGACY_KEYS.any(prefs::contains)) {
+            prefs.edit().apply { LEGACY_KEYS.forEach(::remove) }.apply()
+        }
     }
 
     fun load() = AppSettings(
         provider = Provider.fromId(prefs.getString(KEY_PROVIDER, null)),
         token = prefs.getString(KEY_TOKEN, "").orEmpty(),
-        osApiKey = prefs.getString(KEY_OS_KEY, "").orEmpty(),
-        osUsername = prefs.getString(KEY_OS_USER, "").orEmpty(),
-        osPassword = prefs.getString(KEY_OS_PASSWORD, "").orEmpty(),
+        subtitlesEnabled = prefs.getBoolean(KEY_SUBS_ENABLED, true),
         subtitleLanguages = prefs.getString(KEY_SUB_LANGUAGES, null) ?: DEFAULT_SUBTITLE_LANGUAGES,
     )
 
@@ -30,9 +32,7 @@ class SettingsStore(context: Context) {
         prefs.edit()
             .putString(KEY_PROVIDER, settings.provider.id)
             .putString(KEY_TOKEN, settings.token)
-            .putString(KEY_OS_KEY, settings.osApiKey)
-            .putString(KEY_OS_USER, settings.osUsername)
-            .putString(KEY_OS_PASSWORD, settings.osPassword)
+            .putBoolean(KEY_SUBS_ENABLED, settings.subtitlesEnabled)
             .putString(KEY_SUB_LANGUAGES, settings.subtitleLanguages)
             .apply()
     }
@@ -52,9 +52,6 @@ class SettingsStore(context: Context) {
             mapOf(
                 "provider" to KEY_PROVIDER,
                 "token" to KEY_TOKEN,
-                "opensubtitles_api_key" to KEY_OS_KEY,
-                "opensubtitles_username" to KEY_OS_USER,
-                "opensubtitles_password" to KEY_OS_PASSWORD,
                 "subtitle_languages" to KEY_SUB_LANGUAGES,
             ).forEach { (field, key) ->
                 seed.optString(field, "").trim().takeIf { it.isNotEmpty() }?.let { editor.putString(key, it) }
@@ -67,9 +64,8 @@ class SettingsStore(context: Context) {
     private companion object {
         const val KEY_PROVIDER = "provider"
         const val KEY_TOKEN = "token"
-        const val KEY_OS_KEY = "opensubtitles_api_key"
-        const val KEY_OS_USER = "opensubtitles_username"
-        const val KEY_OS_PASSWORD = "opensubtitles_password"
+        const val KEY_SUBS_ENABLED = "subtitles_enabled"
+        val LEGACY_KEYS = listOf("opensubtitles_api_key", "opensubtitles_username", "opensubtitles_password")
         const val KEY_SUB_LANGUAGES = "subtitle_languages"
         const val SEED_FILE = "seed_settings.json"
 

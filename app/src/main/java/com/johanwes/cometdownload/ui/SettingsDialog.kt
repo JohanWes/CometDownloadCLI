@@ -30,6 +30,7 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.selection.toggleable
 import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
@@ -46,6 +47,7 @@ import androidx.compose.material3.SegmentedButton
 import androidx.compose.material3.SegmentedButtonDefaults
 import androidx.compose.material3.SingleChoiceSegmentedButtonRow
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
@@ -56,6 +58,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.Role
 import androidx.compose.ui.text.input.ImeAction
 import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.ui.text.input.PasswordVisualTransformation
@@ -74,7 +77,6 @@ fun SettingsDialog(
     onDismiss: () -> Unit,
     onSave: (AppSettings) -> String?,
     onTestDebrid: suspend (Provider, String) -> Result<String>,
-    onTestSubtitles: suspend (String, String, String) -> Result<String>,
 ) {
     var draft by remember { mutableStateOf(current) }
     var error by remember { mutableStateOf<String?>(null) }
@@ -162,34 +164,25 @@ fun SettingsDialog(
 
                 Section(
                     "Subtitles",
-                    "Optional. Saves an .srt from OpenSubtitles next to each download. " +
-                        "Needs an API key and your opensubtitles.com account.",
+                    "Saves an .srt next to each download. No account needed.",
                 ) {
-                    SecretField(
-                        value = draft.osApiKey,
-                        onValueChange = { draft = draft.copy(osApiKey = it) },
-                        label = "OpenSubtitles API key",
-                    )
-                    OutlinedTextField(
-                        value = draft.osUsername,
-                        onValueChange = { draft = draft.copy(osUsername = it) },
-                        label = { Text("Username") },
-                        singleLine = true,
-                        keyboardOptions = KeyboardOptions(imeAction = ImeAction.Next),
-                        modifier = Modifier.fillMaxWidth(),
-                    )
-                    SecretField(
-                        value = draft.osPassword,
-                        onValueChange = { draft = draft.copy(osPassword = it) },
-                        label = "Password",
-                    )
-                    TestRow(
-                        linkLabel = "Get API key",
-                        linkUrl = "https://www.opensubtitles.com/en/consumers",
-                        testKey = Triple(draft.osApiKey, draft.osUsername, draft.osPassword),
-                        canTest = draft.osApiKey.isNotBlank(),
-                        onTest = { onTestSubtitles(draft.osApiKey, draft.osUsername, draft.osPassword) },
-                    )
+                    Row(
+                        Modifier
+                            .fillMaxWidth()
+                            .toggleable(
+                                value = draft.subtitlesEnabled,
+                                role = Role.Switch,
+                                onValueChange = { draft = draft.copy(subtitlesEnabled = it) },
+                            ),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Text(
+                            "Download subtitles",
+                            style = MaterialTheme.typography.bodyLarge,
+                            modifier = Modifier.weight(1f),
+                        )
+                        Switch(checked = draft.subtitlesEnabled, onCheckedChange = null)
+                    }
                     OutlinedTextField(
                         value = draft.subtitleLanguages,
                         onValueChange = { draft = draft.copy(subtitleLanguages = it) },

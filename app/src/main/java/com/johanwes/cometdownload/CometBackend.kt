@@ -11,7 +11,7 @@ import org.json.JSONObject
 
 /**
  * The Python side of the app (`comet.android_api`): search, the download manager, the library
- * of finished downloads and OpenSubtitles. One instance per process, shared by the activities
+ * of finished downloads and subtitles. One instance per process, shared by the activities
  * and the download service.
  *
  * Every call blocks (most do network or disk work), so call them off the main thread. Failures
@@ -24,18 +24,13 @@ class CometBackend private constructor(private val api: PyObject, val downloadsP
             "configure",
             settings.provider.id,
             settings.token,
-            settings.osApiKey,
-            settings.osUsername,
-            settings.osPassword,
             settings.subtitleLanguages,
+            settings.subtitlesEnabled,
         )
     }
 
     fun testDebrid(provider: Provider, token: String): String =
         api.callAttr("test_debrid", provider.id, token).toString()
-
-    fun testOpenSubtitles(apiKey: String, username: String, password: String): String =
-        api.callAttr("test_opensubtitles", apiKey, username, password).toString()
 
     // Search
 
@@ -98,15 +93,14 @@ class CometBackend private constructor(private val api: PyObject, val downloadsP
     fun subtitleLanguages(): List<SubtitleLanguage> =
         parseSubtitleLanguages(api.callAttr("subtitle_languages").toString())
 
-    /** OpenSubtitles results for one downloaded video, best match first. */
+    /** Subtitles found online for one downloaded video, best match first. */
     fun searchSubtitles(videoPath: String, languages: String): List<OnlineSubtitle> =
         parseOnlineSubtitles(api.callAttr("subtitle_search", videoPath, languages).toString())
 
-    /** Saves one subtitle next to the video (counts against the daily download quota). */
-    fun downloadSubtitle(videoPath: String, subtitle: OnlineSubtitle): SubtitleDownload {
-        val result = JSONObject(api.callAttr("subtitle_download", videoPath, subtitle.fileId, subtitle.language).toString())
-        return SubtitleDownload(path = result.getString("path"), remaining = result.optInt("remaining", -1))
-    }
+    /** Saves one subtitle next to the video and returns the path of the new file. */
+    fun downloadSubtitle(videoPath: String, subtitle: OnlineSubtitle): String =
+        JSONObject(api.callAttr("subtitle_download", videoPath, subtitle.fileId, subtitle.language).toString())
+            .getString("path")
 
     private fun jobId(result: PyObject): Int = JSONObject(result.toString()).getInt("job_id")
 

@@ -18,14 +18,12 @@ enum class Provider(val id: String, val label: String, val tokenUrl: String) {
 data class AppSettings(
     val provider: Provider = Provider.RealDebrid,
     val token: String = "",
-    val osApiKey: String = "",
-    val osUsername: String = "",
-    val osPassword: String = "",
+    /** Whether a finished download gets a subtitle file by itself. Needs no account. */
+    val subtitlesEnabled: Boolean = true,
     /** Subtitle languages in order of preference; the first one found is downloaded. */
     val subtitleLanguages: String = DEFAULT_SUBTITLE_LANGUAGES,
 ) {
     val isConfigured: Boolean get() = token.isNotBlank()
-    val subtitlesEnabled: Boolean get() = osApiKey.isNotBlank()
 }
 
 const val DEFAULT_SUBTITLE_LANGUAGES = "en, sv"
@@ -261,9 +259,9 @@ fun parseJobs(raw: String): List<JobItem> = JSONArray(raw).objects().map { obj -
 
 data class SubtitleLanguage(val code: String, val name: String, val preferred: Boolean)
 
-/** One subtitle offered by OpenSubtitles for a video. */
+/** One subtitle offered online for a video. */
 data class OnlineSubtitle(
-    val fileId: Int,
+    val fileId: Long,
     val language: String,
     val languageName: String,
     val release: String,
@@ -276,16 +274,13 @@ data class OnlineSubtitle(
     val path: String,
 )
 
-/** A subtitle that was just saved, and the downloads left today (-1 when unknown). */
-data class SubtitleDownload(val path: String, val remaining: Int)
-
 fun parseSubtitleLanguages(raw: String): List<SubtitleLanguage> = JSONArray(raw).objects().map { obj ->
     SubtitleLanguage(obj.getString("code"), obj.getString("name"), obj.optBoolean("preferred", false))
 }
 
 fun parseOnlineSubtitles(raw: String): List<OnlineSubtitle> = JSONArray(raw).objects().map { obj ->
     OnlineSubtitle(
-        fileId = obj.getInt("file_id"),
+        fileId = obj.getLong("file_id"),
         language = obj.getString("language"),
         languageName = obj.optStringOrBlank("language_name"),
         release = obj.optStringOrBlank("release"),

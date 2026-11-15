@@ -779,7 +779,7 @@ internal fun SubtitleLine(job: JobItem) {
         "found" -> DetailLine(Icons.Outlined.Subtitles, job.subtitleMessage, MaterialTheme.colorScheme.primary)
         "partial" -> DetailLine(Icons.Outlined.Subtitles, job.subtitleMessage)
         "missing", "failed" -> DetailLine(Icons.Outlined.SubtitlesOff, job.subtitleMessage)
-        else -> Unit // "off" (no API key) or not reached
+        else -> Unit // "off" (turned off in Settings) or not reached
     }
 }
 

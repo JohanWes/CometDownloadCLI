@@ -1,24 +1,28 @@
-"""Subtitles: the OpenSubtitles client, result ranking, sidecar files and the reader for
-subtitle tracks embedded in Matroska files. Shared by the CLI and the Android app."""
+"""Subtitles: keyless search and download (the OpenSubtitles catalogue, reached through the
+legacy opensubtitles.org REST API and Stremio's OpenSubtitles addon), result ranking, sidecar
+files and the reader for subtitle tracks embedded in Matroska files. Shared by the CLI and
+the Android app. No account, API key or login is involved."""
 import gzip
 import io
 import json
 import os
 import re
-import threading
 import time
-import zipfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any
 from urllib.error import HTTPError, URLError
-from urllib.parse import urlencode, urlparse
+from urllib.parse import quote
 from urllib.request import Request, urlopen
 
-OPENSUBTITLES_SESSION_LOCK = threading.Lock()
-OPENSUBTITLES_SESSION_CACHE: dict[tuple[str, str, str], tuple[str, str]] = {}
-OPENSUBTITLES_DEFAULT_BASE_URL = "https://api.opensubtitles.com/api/v1"
-OPENSUBTITLES_USER_AGENT = "CometDownloadCLI v0.1.0"
+# Search with full metadata (file-hash matches, trusted uploaders, machine translations).
+LEGACY_SEARCH_URL = "https://rest.opensubtitles.org/search"
+# Same catalogue with less detail; used when the legacy API is down or finds nothing.
+STREMIO_ADDON_URL = "https://opensubtitles-v3.strem.io/subtitles"
+# Serves a subtitle file by its id as UTF-8, without the ad the legacy links add.
+STREMIO_DOWNLOAD_URL = "https://subs5.strem.io/en/download/subencoding-stremio-utf8/src-api/file"
+LEGACY_DOWNLOAD_URL = "https://dl.opensubtitles.org/en/download/file"
+SUBTITLE_USER_AGENT = "CometDownloadCLI v1.0.1"
 
 
 DEFAULT_SUBTITLE_LANGUAGES: tuple[str, ...] = ("en", "sv")
@@ -30,6 +34,21 @@ SUBTITLE_LANGUAGE_NAMES = {
     "ar": "Arabic", "tr": "Turkish", "ru": "Russian", "uk": "Ukrainian", "el": "Greek",
     "he": "Hebrew", "hu": "Hungarian", "cs": "Czech", "ro": "Romanian", "hr": "Croatian",
     "sr": "Serbian", "bg": "Bulgarian", "is": "Icelandic", "et": "Estonian",
+}
+# Our language codes -> the three-letter ids both subtitle sources use.
+_SOURCE_LANGUAGE_IDS = {
+    "en": "eng", "sv": "swe", "no": "nor", "da": "dan", "fi": "fin", "de": "ger", "fr": "fre",
+    "es": "spa", "it": "ita", "nl": "dut", "pt": "por", "pt-br": "pob", "pl": "pol",
+    "ja": "jpn", "ko": "kor", "zh": "chi", "zh-cn": "chi", "zh-tw": "zht", "ar": "ara",
+    "tr": "tur", "ru": "rus", "uk": "ukr", "el": "ell", "he": "heb", "hu": "hun", "cs": "cze",
+    "ro": "rum", "hr": "hrv", "sr": "scc", "bg": "bul", "is": "ice", "et": "est",
+}
+_ISO639_2_TO_1 = {
+    "eng": "en", "swe": "sv", "nor": "no", "nob": "no", "nno": "no", "dan": "da", "fin": "fi",
+    "ger": "de", "deu": "de", "fre": "fr", "fra": "fr", "spa": "es", "ita": "it", "dut": "nl",
+    "nld": "nl", "por": "pt", "pol": "pl", "jpn": "ja", "rus": "ru", "chi": "zh", "zho": "zh",
+    "kor": "ko", "ara": "ar", "tur": "tr", "hun": "hu", "cze": "cs", "ces": "cs", "gre": "el",
+    "ell": "el", "heb": "he", "ice": "is", "isl": "is", "rum": "ro", "ron": "ro",
 }
 
 
@@ -46,195 +65,60 @@ def subtitle_language_name(code: str) -> str:
     return SUBTITLE_LANGUAGE_NAMES.get(code.lower(), code.upper())
 
 
+def _source_language_ids(languages: tuple[str, ...]) -> dict[str, str]:
+    """Source id -> our code, in preference order, for the languages the sources know."""
+    ids: dict[str, str] = {}
+    for code in languages:
+        source = _SOURCE_LANGUAGE_IDS.get(code)
+        if source is None and len(code) == 2:
+            source = next((three for three, two in _ISO639_2_TO_1.items() if two == code), None)
+        if source is None and len(code) == 3:
+            source = code
+        if source is not None:
+            ids.setdefault(source, code)
+    return ids
+
+
 @dataclass(frozen=True)
-class OpenSubtitlesConfig:
-    api_key: str
-    username: str
-    password: str
+class SubtitleConfig:
     languages: tuple[str, ...] = DEFAULT_SUBTITLE_LANGUAGES
-
-    @property
-    def is_configured(self) -> bool:
-        """An API key turns the subtitle step on; downloads also need an account login."""
-        return bool(self.api_key)
-
-    @property
-    def has_login(self) -> bool:
-        return bool(self.username and self.password)
+    enabled: bool = True
 
 
-def opensubtitles_headers(
-    config: OpenSubtitlesConfig,
-    token: str | None = None,
-    *,
-    content_type: bool = False,
-) -> dict[str, str]:
-    headers = {
-        "Accept": "application/json",
-        "Api-Key": config.api_key,
-        "User-Agent": OPENSUBTITLES_USER_AGENT,
-    }
-    if content_type:
-        headers["Content-Type"] = "application/json"
-    if token:
-        headers["Authorization"] = f"Bearer {token}"
-    return headers
-
-
-def normalize_opensubtitles_base_url(value: str) -> str:
-    value = value.strip()
-    if not value:
-        return OPENSUBTITLES_DEFAULT_BASE_URL
-    if not value.startswith(("http://", "https://")):
-        value = f"https://{value}"
-    value = value.rstrip("/")
-    if value.endswith("/api/v1"):
-        return value
-    return value + "/api/v1"
-
-
-class OpenSubtitlesError(RuntimeError):
-    def __init__(self, message: str, *, status: int | None = None, retry_after: float | None = None) -> None:
+class SubtitleError(RuntimeError):
+    def __init__(self, message: str, *, status: int | None = None) -> None:
         super().__init__(message)
         self.status = status
-        self.retry_after = retry_after
 
 
-class OpenSubtitlesQuotaError(OpenSubtitlesError):
-    pass
-
-
-OPENSUBTITLES_LOGIN_FAILURES: dict[tuple[str, str, str], float] = {}
-OPENSUBTITLES_LOGIN_RETRY_SECONDS = 15 * 60
-
-
-def _opensubtitles_error_message(body: bytes) -> str:
-    try:
-        payload = json.loads(body.decode("utf-8", errors="replace"))
-    except ValueError:
-        return ""
-    if isinstance(payload, dict):
-        for key in ("message", "error", "errors"):
-            value = payload.get(key)
-            if isinstance(value, list):
-                value = "; ".join(str(item) for item in value)
-            if value:
-                return str(value)[:160]
-    return ""
-
-
-def opensubtitles_request(
-    config: OpenSubtitlesConfig,
-    url: str,
-    *,
-    token: str | None = None,
-    payload: dict[str, Any] | None = None,
-    timeout: int = 30,
-) -> dict[str, Any]:
-    """One OpenSubtitles call. Retries once after a 429; errors never include URLs or keys."""
+def _fetch(url: str, *, timeout: int = 30) -> tuple[bytes, str]:
+    """One GET: the body and its content type. Retries once after a 429; errors never
+    include the URL."""
     for attempt in range(2):
-        request = Request(
-            url,
-            data=json.dumps(payload).encode("utf-8") if payload is not None else None,
-            headers=opensubtitles_headers(config, token, content_type=payload is not None),
-            method="POST" if payload is not None else "GET",
-        )
+        request = Request(url, headers={"User-Agent": SUBTITLE_USER_AGENT, "Accept": "*/*"})
         try:
             with urlopen(request, timeout=timeout) as response:
-                return json.loads(response.read().decode("utf-8"))
+                return response.read(), response.headers.get("Content-Type", "")
         except HTTPError as error:
-            detail = _opensubtitles_error_message(error.read())
-            retry_after = None
-            for header in ("Retry-After", "ratelimit-reset", "X-RateLimit-Reset"):
-                value = (error.headers.get(header) or "").strip()
-                if value.replace(".", "", 1).isdigit():
-                    retry_after = float(value)
-                    break
             if error.code == 429 and attempt == 0:
-                time.sleep(min(retry_after or 2.0, 10.0))
+                value = (error.headers.get("Retry-After") or "").strip()
+                time.sleep(min(float(value) if value.replace(".", "", 1).isdigit() else 2.0, 10.0))
                 continue
-            if error.code == 406 and "download" in url:
-                raise OpenSubtitlesQuotaError(
-                    detail or "Daily download limit reached.", status=406, retry_after=retry_after
-                ) from None
-            raise OpenSubtitlesError(
-                f"OpenSubtitles HTTP {error.code}" + (f": {detail}" if detail else ""),
-                status=error.code,
-                retry_after=retry_after,
-            ) from None
-        except (URLError, OSError, ValueError) as error:
+            if error.code == 429:
+                raise SubtitleError("The subtitle service is rate limiting requests.", status=429) from None
+            raise SubtitleError(f"The subtitle service returned HTTP {error.code}.", status=error.code) from None
+        except (URLError, OSError) as error:
             reason = getattr(error, "reason", None) or error.__class__.__name__
-            raise OpenSubtitlesError(f"Could not reach OpenSubtitles ({reason}).") from None
-    raise OpenSubtitlesError("OpenSubtitles is rate limiting requests.", status=429)
+            raise SubtitleError(f"Could not reach the subtitle service ({reason}).") from None
+    raise SubtitleError("The subtitle service is rate limiting requests.", status=429)
 
 
-class OpenSubtitlesSession:
-    """Lazily signed-in session shared across jobs; re-logs in when the token expires."""
-
-    def __init__(self, config: OpenSubtitlesConfig) -> None:
-        self.config = config
-        self.token: str | None = None
-        self.base_url = OPENSUBTITLES_DEFAULT_BASE_URL
-        self.login_error = ""
-        self._login(force=False)
-
-    def _key(self) -> tuple[str, str, str]:
-        return (self.config.api_key, self.config.username, self.config.password)
-
-    def _login(self, *, force: bool) -> None:
-        if not self.config.has_login:
-            return
-        key = self._key()
-        with OPENSUBTITLES_SESSION_LOCK:
-            if force:
-                OPENSUBTITLES_SESSION_CACHE.pop(key, None)
-            cached = OPENSUBTITLES_SESSION_CACHE.get(key)
-            if cached is not None:
-                self.token, self.base_url = cached
-                return
-            failed_at = OPENSUBTITLES_LOGIN_FAILURES.get(key)
-            if failed_at is not None and time.time() - failed_at < OPENSUBTITLES_LOGIN_RETRY_SECONDS:
-                self.login_error = "OpenSubtitles rejected the sign-in a moment ago; check your details or wait a few minutes"
-                self.token = None
-                return
-            try:
-                payload = opensubtitles_request(
-                    self.config,
-                    f"{OPENSUBTITLES_DEFAULT_BASE_URL}/login",
-                    payload={"username": self.config.username, "password": self.config.password},
-                )
-            except OpenSubtitlesError as error:
-                rejected = error.status in (400, 401, 403)
-                # Back off after a rejection or rate limit (OpenSubtitles blocks clients that
-                # keep hammering /login), but let a network hiccup be retried right away.
-                if rejected or error.status == 429:
-                    OPENSUBTITLES_LOGIN_FAILURES[key] = time.time()
-                self.login_error = "OpenSubtitles rejected the username or password" if rejected else str(error)
-                self.token = None
-                return
-            token = str(payload.get("token", "")).strip()
-            if not token:
-                OPENSUBTITLES_LOGIN_FAILURES[key] = time.time()
-                self.login_error = "OpenSubtitles sign-in returned no token"
-                return
-            OPENSUBTITLES_LOGIN_FAILURES.pop(key, None)
-            self.token = token
-            self.base_url = normalize_opensubtitles_base_url(str(payload.get("base_url", "")))
-            OPENSUBTITLES_SESSION_CACHE[key] = (self.token, self.base_url)
-            self.login_error = ""
-
-    def call(self, path: str, *, params: dict[str, str] | None = None, payload: dict[str, Any] | None = None):
-        url = f"{self.base_url}{path}"
-        if params:
-            # OpenSubtitles asks for sorted, lower-case query params (otherwise it redirects).
-            url += "?" + urlencode(sorted((key.lower(), value.lower()) for key, value in params.items()))
-        try:
-            return opensubtitles_request(self.config, url, token=self.token, payload=payload)
-        except OpenSubtitlesError as error:
-            if error.status != 401 or not self.token:
-                raise
-        self._login(force=True)
-        return opensubtitles_request(self.config, url, token=self.token, payload=payload)
+def _fetch_json(url: str) -> Any:
+    body, _ = _fetch(url)
+    try:
+        return json.loads(body.decode("utf-8", errors="replace"))
+    except ValueError:
+        raise SubtitleError("The subtitle service sent an unreadable answer.") from None
 
 
 def imdb_id_number(imdb_id: str) -> str:
@@ -283,135 +167,244 @@ class SubtitleChoice:
     hearing_impaired: bool = False
     machine_translated: bool = False
     download_count: int = 0
+    trusted: bool = False
 
 
 def rank_subtitles(
-    rows: list[dict[str, Any]], languages: tuple[str, ...], video_name: str
+    choices: list[SubtitleChoice], languages: tuple[str, ...], video_name: str
 ) -> list[SubtitleChoice]:
-    """Best first: preferred language, then human over machine/AI translations,
-    then exact file-hash matches (always in sync), release-name similarity, trust, popularity."""
+    """Best first: preferred language, then human over machine translations, then exact
+    file-hash matches (always in sync), release-name similarity, trust, popularity."""
     video_tokens = release_tokens(video_name)
-    ranked: list[tuple[tuple, SubtitleChoice]] = []
-    for row in rows:
-        attributes = row.get("attributes") if isinstance(row, dict) else None
-        if not isinstance(attributes, dict) or attributes.get("foreign_parts_only") is True:
-            continue
-        language = str(attributes.get("language") or "").lower()
-        if language not in languages:
-            continue
-        file_id = None
-        for file_info in attributes.get("files") or []:
-            try:
-                file_id = int(file_info.get("file_id"))
-                break
-            except (AttributeError, TypeError, ValueError):
-                continue
-        if file_id is None:
-            continue
-        release = str(attributes.get("release") or "")
-        file_names = " ".join(str(f.get("file_name") or "") for f in attributes.get("files") or [] if isinstance(f, dict))
-        tokens = release_tokens(release) | release_tokens(file_names)
+
+    def key(choice: SubtitleChoice) -> tuple:
+        tokens = release_tokens(choice.release)
         similarity = len(tokens & video_tokens) / max(len(tokens | video_tokens), 1)
-        hash_match = attributes.get("moviehash_match") is True
-        machine = bool(attributes.get("machine_translated")) or bool(attributes.get("ai_translated"))
-        downloads = int(attributes.get("download_count") or 0)
-        key = (
-            languages.index(language),
-            machine,
-            not hash_match,
+        return (
+            languages.index(choice.language),
+            choice.machine_translated,
+            not choice.hash_match,
             -round(similarity, 2),
-            not attributes.get("from_trusted"),
-            -downloads,
+            not choice.trusted,
+            -choice.download_count,
         )
-        choice = SubtitleChoice(
-            file_id,
-            language,
-            hash_match,
-            release or file_names.strip(),
-            hearing_impaired=bool(attributes.get("hearing_impaired")),
-            machine_translated=machine,
-            download_count=downloads,
+
+    return sorted((choice for choice in choices if choice.language in languages), key=key)
+
+
+def _flag(value: Any) -> bool:
+    return str(value or "0").strip() not in ("0", "")
+
+
+def _number(value: Any) -> int:
+    try:
+        return int(str(value).strip())
+    except (TypeError, ValueError):
+        return 0
+
+
+def _legacy_choice(row: Any, language_ids: dict[str, str]) -> SubtitleChoice | None:
+    """One row of the legacy API as a choice; None for anything we can't use (other
+    language, forced-only, split over several files, not SubRip)."""
+    if not isinstance(row, dict):
+        return None
+    language = language_ids.get(str(row.get("SubLanguageID") or "").lower())
+    file_id = _number(row.get("IDSubtitleFile"))
+    if language is None or not file_id or _flag(row.get("SubForeignPartsOnly")):
+        return None
+    if _number(row.get("SubSumCD")) > 1 or str(row.get("SubFormat") or "srt").lower() != "srt":
+        return None
+    release = str(row.get("MovieReleaseName") or "").strip()
+    file_name = str(row.get("SubFileName") or "").strip()
+    return SubtitleChoice(
+        file_id,
+        language,
+        str(row.get("MatchedBy") or "") == "moviehash",
+        f"{release} {file_name}".strip() if release and file_name else release or file_name,
+        hearing_impaired=_flag(row.get("SubHearingImpaired")),
+        machine_translated=_flag(row.get("SubAutoTranslation")),
+        download_count=_number(row.get("SubDownloadsCnt")),
+        trusted=_flag(row.get("SubFromTrusted")),
+    )
+
+
+def _legacy_search(segments: dict[str, str]) -> list[Any]:
+    # The legacy API wants its path segments lower-case and in alphabetical order.
+    path = "/".join(f"{key}-{quote(value.lower(), safe='')}" for key, value in sorted(segments.items()))
+    rows = _fetch_json(f"{LEGACY_SEARCH_URL}/{path}")
+    return rows if isinstance(rows, list) else []
+
+
+def _hash_matches(
+    video_path: Path,
+    *,
+    media_type: str,
+    imdb_id: str,
+    season: int | None,
+    episode: int | None,
+    language_ids: dict[str, str],
+) -> list[SubtitleChoice]:
+    """Subtitles uploaded for this exact video file, so they are in sync. The hash index
+    holds a few wrong pairings, so a row must also be for the title we asked for."""
+    try:
+        moviehash = opensubtitles_moviehash(video_path)
+        size = video_path.stat().st_size
+    except OSError:
+        return []
+    if moviehash is None:
+        return []
+    number = imdb_id_number(imdb_id) if imdb_id else ""
+    choices: list[SubtitleChoice] = []
+    for row in _legacy_search({"moviebytesize": str(size), "moviehash": moviehash}):
+        if not isinstance(row, dict):
+            continue
+        if number and media_type == "series":
+            if str(row.get("SeriesIMDBParent") or "").lstrip("0") != number:
+                continue
+            numbers = (_number(row.get("SeriesSeason")), _number(row.get("SeriesEpisode")))
+            if season is not None and episode is not None and numbers != (season, episode):
+                continue
+        elif number and str(row.get("IDMovieImdb") or "").lstrip("0") != number:
+            continue
+        choice = _legacy_choice(row, language_ids)
+        if choice is not None:
+            choices.append(replace(choice, hash_match=True))
+    return choices
+
+
+def _stremio_search(
+    *, media_type: str, imdb_id: str, season: int | None, episode: int | None, language_ids: dict[str, str]
+) -> list[SubtitleChoice]:
+    imdb = imdb_id if imdb_id.lower().startswith("tt") else f"tt{imdb_id}"
+    if media_type == "series":
+        if season is None or episode is None:
+            return []
+        url = f"{STREMIO_ADDON_URL}/series/{imdb}:{season}:{episode}.json"
+    else:
+        url = f"{STREMIO_ADDON_URL}/movie/{imdb}.json"
+    payload = _fetch_json(url)
+    rows = payload.get("subtitles") if isinstance(payload, dict) else None
+    choices: list[SubtitleChoice] = []
+    for row in rows or []:
+        if not isinstance(row, dict):
+            continue
+        language = language_ids.get(str(row.get("lang") or "").lower())
+        file_id = _number(str(row.get("url") or "").rstrip("/").rsplit("/", 1)[-1])
+        if language is None or not file_id:
+            continue
+        release = str(row.get("movieReleaseName") or "").strip()
+        file_name = str(row.get("subtitleFileName") or "").strip()
+        choices.append(
+            SubtitleChoice(
+                file_id,
+                language,
+                False,
+                f"{release} {file_name}".strip() if release and file_name else release or file_name,
+                hearing_impaired=bool(re.search(r"\b(hi|sdh|cc)\b", file_name, re.IGNORECASE)),
+            )
         )
-        ranked.append((key, choice))
-    ranked.sort(key=lambda item: item[0])
-    return [choice for _, choice in ranked]
+    return choices
 
 
 def search_subtitles(
-    session: OpenSubtitlesSession,
     *,
     media_type: str,
     imdb_id: str,
     video_path: Path,
     season: int | None,
     episode: int | None,
-    languages: tuple[str, ...] | None = None,
+    languages: tuple[str, ...],
+    exclude: set[int] | None = None,
+    first_language_only: bool = False,
 ) -> list[SubtitleChoice]:
     """Every matching subtitle, best first (see [rank_subtitles]). Without an IMDb id the
-    title is looked up by the video's file name and hash instead."""
-    languages = languages or session.config.languages
-    params = {"languages": ",".join(sorted(languages))}
-    if not imdb_id:
-        params["query"] = video_path.stem
-    elif media_type == "series":
-        params.update(
-            parent_imdb_id=imdb_id_number(imdb_id),
-            season_number=str(season),
-            episode_number=str(episode),
-            type="episode",
-        )
-    else:
-        params.update(imdb_id=imdb_id_number(imdb_id), type="movie")
+    title is looked up by the video's file name instead. With [first_language_only] the
+    search stops at the first preferred language that has something (fewer requests)."""
+    exclude = exclude or set()
+    language_ids = _source_language_ids(languages)
+    found: dict[int, SubtitleChoice] = {}
+    error: SubtitleError | None = None
+
+    def add(choices: list[SubtitleChoice]) -> None:
+        for choice in choices:
+            if choice.file_id not in exclude and choice.file_id not in found:
+                found[choice.file_id] = choice
+
     try:
-        moviehash = opensubtitles_moviehash(video_path)
-    except OSError:
-        moviehash = None
-    if moviehash is not None:
-        params["moviehash"] = moviehash
-    rows = session.call("/subtitles", params=params).get("data") or []
-    if not rows and moviehash is not None:
-        params.pop("moviehash")
-        rows = session.call("/subtitles", params=params).get("data") or []
-    return rank_subtitles(rows, languages, video_path.name)
+        add(
+            _hash_matches(
+                video_path,
+                media_type=media_type,
+                imdb_id=imdb_id,
+                season=season,
+                episode=episode,
+                language_ids=language_ids,
+            )
+        )
+    except SubtitleError as hash_error:
+        error = hash_error
+
+    segments: dict[str, str]
+    is_episode = media_type == "series" and season is not None and episode is not None
+    if imdb_id and (media_type != "series" or is_episode):
+        segments = {"imdbid": imdb_id_number(imdb_id)}
+        if is_episode:
+            segments.update(season=str(season), episode=str(episode))
+    else:
+        segments = {"query": video_path.stem}
+    for source_id, language in language_ids.items():
+        if first_language_only and any(choice.language == language for choice in found.values()):
+            break
+        if error is not None:
+            break  # the legacy API is down; don't wait for it once per language
+        try:
+            rows = _legacy_search({**segments, "sublanguageid": source_id})
+        except SubtitleError as search_error:
+            error = search_error
+            break
+        add([choice for row in rows if (choice := _legacy_choice(row, {source_id: language})) is not None])
+        if first_language_only and any(choice.language == language for choice in found.values()):
+            break
+
+    if not found and imdb_id:
+        try:
+            add(
+                _stremio_search(
+                    media_type=media_type,
+                    imdb_id=imdb_id,
+                    season=season,
+                    episode=episode,
+                    language_ids=language_ids,
+                )
+            )
+        except SubtitleError as stremio_error:
+            error = error or stremio_error
+    if not found and error is not None:
+        raise error
+    return rank_subtitles(list(found.values()), languages, video_path.name)
 
 
 def find_subtitle(
-    session: OpenSubtitlesSession,
     *,
     media_type: str,
     imdb_id: str,
     video_path: Path,
     season: int | None,
     episode: int | None,
-    languages: tuple[str, ...] | None = None,
+    languages: tuple[str, ...],
     exclude: set[int] | None = None,
 ) -> SubtitleChoice | None:
     ranked = search_subtitles(
-        session,
         media_type=media_type,
         imdb_id=imdb_id,
         video_path=video_path,
         season=season,
         episode=episode,
         languages=languages,
+        exclude=exclude,
+        first_language_only=True,
     )
-    return next((choice for choice in ranked if choice.file_id not in (exclude or set())), None)
-
-
-def subtitle_bytes_from_download(raw: bytes, content_type: str, source_url: str) -> bytes:
-    lower_url = urlparse(source_url).path.lower()
-    if "gzip" in content_type.lower() or lower_url.endswith(".gz"):
-        return gzip.decompress(raw)
-    if "zip" in content_type.lower() or lower_url.endswith(".zip"):
-        with zipfile.ZipFile(io.BytesIO(raw)) as archive:
-            subtitle_names = [
-                name for name in archive.namelist() if name.lower().endswith((".srt", ".vtt", ".sub"))
-            ]
-            if not subtitle_names:
-                raise RuntimeError("OpenSubtitles archive did not contain a subtitle file.")
-            with archive.open(subtitle_names[0]) as file_handle:
-                return file_handle.read()
-    return raw
+    return ranked[0] if ranked else None
 
 
 def normalize_subtitle_text(raw: bytes) -> bytes:
@@ -428,6 +421,35 @@ def normalize_subtitle_text(raw: bytes) -> bytes:
         return raw.decode("cp1252", errors="replace").encode("utf-8")
 
 
+_AD_CUE = re.compile(
+    r"opensubtitles|osdb\.link|(get|try)ray\.app|advertise your product|rate this subtitle", re.IGNORECASE
+)
+_AD_FIRST_TIMING = "00:00:06,000 --> 00:00:12,074"
+_CUE_TIMING = re.compile(r"(\d+):(\d\d):(\d\d)[,.](\d{3}) --> (\d+):(\d\d):(\d\d)[,.](\d{3})")
+
+
+def _is_ad_cue(block: str, *, last: bool) -> bool:
+    """The legacy download host adds one cue at a fixed time near the start and a
+    minute-long one after the last line; the wording changes, the timing doesn't."""
+    if _AD_CUE.search(block) or _AD_FIRST_TIMING in block:
+        return True
+    match = _CUE_TIMING.search(block)
+    if not last or match is None:
+        return False
+    h1, m1, s1, ms1, h2, m2, s2, ms2 = (int(part) for part in match.groups())
+    return (h2 * 3600 + m2 * 60 + s2) * 1000 + ms2 - ((h1 * 3600 + m1 * 60 + s1) * 1000 + ms1) >= 59_000
+
+
+def strip_ad_cues(raw: bytes) -> bytes:
+    """Drops the advertising cues the legacy download links add to a subtitle."""
+    text = normalize_subtitle_text(raw).decode("utf-8").replace("\r\n", "\n")
+    blocks = [block for block in re.split(r"\n{2,}", text) if block.strip()]
+    kept = [
+        block for index, block in enumerate(blocks) if not _is_ad_cue(block, last=index == len(blocks) - 1)
+    ]
+    return ("\n\n".join(kept) + "\n").encode("utf-8")
+
+
 def write_subtitle_sidecar(
     video_path: Path, subtitle_bytes: bytes, language: str = "en", *, overwrite: bool = False
 ) -> Path:
@@ -440,35 +462,36 @@ def write_subtitle_sidecar(
     return destination
 
 
-def download_subtitle_file(
-    session: OpenSubtitlesSession, file_id: int, language: str, video_path: Path, *, overwrite: bool = False
-) -> tuple[Path, int | None]:
-    """Saves one subtitle next to the video. Returns the sidecar and how many downloads the
-    account has left today (None when OpenSubtitles doesn't say)."""
-    payload = session.call("/download", payload={"file_id": file_id, "sub_format": "srt"})
-    link = str(payload.get("link", "")).strip()
-    if not link:
-        raise OpenSubtitlesError(str(payload.get("message") or "OpenSubtitles returned no download link."))
-    request = Request(link, headers={"User-Agent": OPENSUBTITLES_USER_AGENT})
+def _looks_like_subtitle(raw: bytes) -> bool:
+    return b"-->" in raw[:65536]
+
+
+def fetch_subtitle(file_id: int) -> bytes:
+    """One subtitle file by id: from Stremio's mirror (UTF-8, no ads), otherwise from the
+    legacy download host with its ad cues removed."""
     try:
-        with urlopen(request, timeout=60) as response:
-            raw = response.read()
-            content_type = response.headers.get("Content-Type", "")
-    except HTTPError as error:
-        raise OpenSubtitlesError(f"Subtitle file download returned HTTP {error.code}.") from None
-    except (URLError, OSError):
-        raise OpenSubtitlesError("Subtitle file download failed (network).") from None
-    remaining = payload.get("remaining")
-    path = write_subtitle_sidecar(
-        video_path, subtitle_bytes_from_download(raw, content_type, link), language, overwrite=overwrite
-    )
-    return path, remaining if isinstance(remaining, int) else None
+        raw, _ = _fetch(f"{STREMIO_DOWNLOAD_URL}/{int(file_id)}", timeout=60)
+        if _looks_like_subtitle(raw):
+            return raw
+    except SubtitleError:
+        pass
+    raw, _ = _fetch(f"{LEGACY_DOWNLOAD_URL}/{int(file_id)}.gz", timeout=60)
+    try:
+        raw = gzip.decompress(raw)
+    except (OSError, EOFError):
+        pass
+    if not _looks_like_subtitle(raw):
+        raise SubtitleError("The subtitle file could not be downloaded.")
+    return strip_ad_cues(raw)
 
 
-def download_subtitle(
-    session: OpenSubtitlesSession, choice: SubtitleChoice, video_path: Path, *, overwrite: bool = False
-) -> Path:
-    return download_subtitle_file(session, choice.file_id, choice.language, video_path, overwrite=overwrite)[0]
+def download_subtitle_file(file_id: int, language: str, video_path: Path, *, overwrite: bool = False) -> Path:
+    """Saves one subtitle next to the video and returns the sidecar."""
+    return write_subtitle_sidecar(video_path, fetch_subtitle(file_id), language, overwrite=overwrite)
+
+
+def download_subtitle(choice: SubtitleChoice, video_path: Path, *, overwrite: bool = False) -> Path:
+    return download_subtitle_file(choice.file_id, choice.language, video_path, overwrite=overwrite)
 
 
 # --- Embedded subtitle tracks (Matroska) ----------------------------------------------
@@ -484,13 +507,6 @@ _MKV_LANGUAGE_BCP47 = 0x22B59D
 _MKV_FLAG_FORCED = 0x55AA
 _MKV_SCAN_LIMIT = 64 * 1024 * 1024
 _MKV_TRACKS_MAX_BYTES = 8 * 1024 * 1024
-_ISO639_2_TO_1 = {
-    "eng": "en", "swe": "sv", "nor": "no", "nob": "no", "nno": "no", "dan": "da", "fin": "fi",
-    "ger": "de", "deu": "de", "fre": "fr", "fra": "fr", "spa": "es", "ita": "it", "dut": "nl",
-    "nld": "nl", "por": "pt", "pol": "pl", "jpn": "ja", "rus": "ru", "chi": "zh", "zho": "zh",
-    "kor": "ko", "ara": "ar", "tur": "tr", "hun": "hu", "cze": "cs", "ces": "cs", "gre": "el",
-    "ell": "el", "heb": "he", "ice": "is", "isl": "is", "rum": "ro", "ron": "ro",
-}
 _TEXT_SUBTITLE_CODECS = ("S_TEXT/", "S_SSA", "S_ASS")
 
 

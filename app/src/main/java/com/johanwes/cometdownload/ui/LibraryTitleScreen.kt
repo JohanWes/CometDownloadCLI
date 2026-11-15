@@ -226,11 +226,7 @@ fun LibraryTitleScreen(viewModel: CometViewModel, title: LibraryTitle, paneColor
             items(title.jobs, key = { "files-${it.id}" }) { job ->
                 FilesCard(
                     job = job,
-                    onSubtitles = if (viewModel.settings.subtitlesEnabled) {
-                        { tryAnother -> viewModel.refetchSubtitles(job, tryAnother) }
-                    } else {
-                        null
-                    },
+                    onSubtitles = { tryAnother -> viewModel.refetchSubtitles(job, tryAnother) },
                     modifier = Modifier.centered().padding(horizontal = 16.dp, vertical = 4.dp).animateItem(),
                 )
             }

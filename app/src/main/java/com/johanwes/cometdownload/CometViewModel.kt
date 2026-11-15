@@ -375,10 +375,6 @@ class CometViewModel(application: Application) : AndroidViewModel(application) {
         call { backend.testDebrid(provider, token) }
             .recoverCatching { throw IllegalStateException(it.friendlyMessage("Test failed.")) }
 
-    suspend fun testOpenSubtitles(apiKey: String, username: String, password: String): Result<String> =
-        call { backend.testOpenSubtitles(apiKey, username, password) }
-            .recoverCatching { throw IllegalStateException(it.friendlyMessage("Test failed.")) }
-
     private fun isOnMeteredNetwork(): Boolean = runCatching {
         val connectivity = getApplication<Application>().getSystemService(ConnectivityManager::class.java)
         connectivity.isActiveNetworkMetered
@@ -565,9 +561,6 @@ class CometViewModel(application: Application) : AndroidViewModel(application) {
     fun saveSettings(draft: AppSettings): String? {
         val cleaned = draft.copy(
             token = draft.token.trim(),
-            osApiKey = draft.osApiKey.trim(),
-            osUsername = draft.osUsername.trim(),
-            osPassword = draft.osPassword.trim(),
             subtitleLanguages = draft.subtitleLanguages.trim().ifBlank { DEFAULT_SUBTITLE_LANGUAGES },
         )
         if (!cleaned.isConfigured) return "An API token is required."

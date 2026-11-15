@@ -2,7 +2,7 @@
 
 Search for a movie or series, pick a cached result, and download it through Real-Debrid or TorBox for offline viewing. Available as an Android app and a terminal CLI. Built from a fork of [Comet](https://github.com/g0ldyy/comet).
 
-You need your own Real-Debrid or TorBox API token. Subtitles are optional and need a free [OpenSubtitles.com](https://www.opensubtitles.com) API key and login.
+You need your own Real-Debrid or TorBox API token. Subtitles are downloaded automatically and need no account.
 
 ## Android app
 
@@ -49,13 +49,11 @@ REALDEBRID_API_TOKEN=
 TORBOX_API_TOKEN=
 
 # Optional: subtitles
-OPENSUBTITLES_API_KEY=
-OPENSUBTITLES_USERNAME=
-OPENSUBTITLES_PASSWORD=
 OPENSUBTITLES_LANGUAGES=en, sv   # first language found wins
+OPENSUBTITLES_ENABLED=false      # only to turn subtitles off
 ```
 
-With OpenSubtitles set, each video gets a `.<lang>.srt` file next to it. Leave the API key prompt blank to skip subtitles; the CLI saves `OPENSUBTITLES_ENABLED=false` and stops asking.
+Each video gets a `.<lang>.srt` file next to it, with no account or API key. Subtitles come from the OpenSubtitles catalogue through the public opensubtitles.org search and Stremio's OpenSubtitles addon.
 
 ### Troubleshooting
 
@@ -66,7 +64,7 @@ With OpenSubtitles set, each video gets a `.<lang>.srt` file next to it. Leave t
 ## Where your tokens go
 
 - The debrid token is sent to your debrid service through a [StremThru](https://github.com/MunifTanjim/stremthru) server. The default is the public instance `https://stremthru.13377001.xyz`, and whoever runs it can see the token. With the CLI you can run your own and set `STREMTHRU_URL` in `.env`; the Android app always uses the public instance.
-- OpenSubtitles credentials are only sent to OpenSubtitles.
+- Subtitle lookups send no token or login. They send the title's IMDb id, or the video's file name when there is none, plus a hash and size of the video file to `rest.opensubtitles.org`, and the IMDb id to `opensubtitles-v3.strem.io` as a fallback.
 - The CLI keeps tokens in `.env` (mode 600). The app keeps them in encrypted preferences, excluded from backups. Tokens are kept out of logs and error messages.
 
 ## Releasing

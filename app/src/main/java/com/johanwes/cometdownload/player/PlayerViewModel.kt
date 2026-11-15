@@ -130,10 +130,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
     var online by mutableStateOf<Load<List<OnlineSubtitle>>>(Load.Idle)
         private set
     /** File id of the subtitle being downloaded, if any. */
-    var downloading by mutableStateOf<Int?>(null)
-        private set
-    /** OpenSubtitles downloads left today; -1 until a download reports it. */
-    var quotaRemaining by mutableIntStateOf(-1)
+    var downloading by mutableStateOf<Long?>(null)
         private set
     var subtitleNotice by mutableStateOf<String?>(null)
         private set
@@ -342,7 +339,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
         subtitleNotice = null
     }
 
-    // --- More subtitles from OpenSubtitles -------------------------------------------------
+    // --- More subtitles found online -------------------------------------------------------
 
     /** Looks up subtitles the first time the panel opens for a video. */
     fun ensureOnlineSearch() {
@@ -378,13 +375,12 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
         viewModelScope.launch {
             io { backend.downloadSubtitle(path, subtitle) }
                 .onSuccess { saved ->
-                    if (saved.remaining >= 0) quotaRemaining = saved.remaining
                     if (path == current?.path) {
                         sidecars = withContext(Dispatchers.IO) { findSidecars(path) }
-                        selectSubtitle(SubtitleSelection.File(saved.path))
+                        selectSubtitle(SubtitleSelection.File(saved))
                         (online as? Load.Ready)?.let { ready ->
                             online = Load.Ready(
-                                ready.value.map { if (it.fileId == subtitle.fileId) it.copy(path = saved.path) else it },
+                                ready.value.map { if (it.fileId == subtitle.fileId) it.copy(path = saved) else it },
                             )
                         }
                     }

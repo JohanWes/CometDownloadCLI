@@ -199,7 +199,6 @@ fun CometApp(viewModel: CometViewModel, onExit: () -> Unit) {
                 onDismiss = viewModel::closeSettings,
                 onSave = viewModel::saveSettings,
                 onTestDebrid = viewModel::testDebrid,
-                onTestSubtitles = viewModel::testOpenSubtitles,
             )
         }
         }

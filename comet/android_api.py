@@ -178,8 +178,6 @@ def friendly_error(error: BaseException | str) -> str:
         # file host or a metadata site says nothing about it.
         if "/v0/store/" in lower:
             return "Your debrid token was rejected. Check it in Settings."
-        if "opensubtitles" in lower:
-            return "OpenSubtitles rejected the login. Check the subtitle settings."
         if "download server" in lower:
             return f"The download link was refused (HTTP {code}). Retry to get a fresh link."
         return f"The server refused the request (HTTP {code}). Try again in a bit."
@@ -755,7 +753,7 @@ class AndroidCometApi:
     def __init__(self, download_dir: str, max_parallel: int = 2, state_dir: str = "") -> None:
         self.provider = ""
         self.token = ""
-        self.subtitles = subs.OpenSubtitlesConfig(api_key="", username="", password="")
+        self.subtitles = subs.SubtitleConfig()
         self.download_dir = Path(download_dir).expanduser()
         self.events: list[dict[str, Any]] = []
         self._event_lock = threading.Lock()
@@ -879,10 +877,8 @@ class AndroidCometApi:
         self,
         provider: str,
         token: str,
-        opensubtitles_api_key: str = "",
-        opensubtitles_username: str = "",
-        opensubtitles_password: str = "",
         subtitle_languages: str = "",
+        subtitles_enabled: bool = True,
     ) -> str:
         provider = provider.strip().lower()
         if provider not in cli.DEBRID_PROVIDERS:
@@ -892,11 +888,9 @@ class AndroidCometApi:
             raise RuntimeError("A provider API token is required.")
         self.provider = provider
         self.token = token
-        self.subtitles = subs.OpenSubtitlesConfig(
-            api_key=opensubtitles_api_key.strip(),
-            username=opensubtitles_username.strip(),
-            password=opensubtitles_password.strip(),
+        self.subtitles = subs.SubtitleConfig(
             languages=subs.parse_subtitle_languages(subtitle_languages),
+            enabled=bool(subtitles_enabled),
         )
         return "ok"
 
@@ -1000,8 +994,6 @@ class AndroidCometApi:
 
     @_friendly
     def refetch_subtitles(self, job_id: int, try_another: bool = False) -> str:
-        if not self.subtitles.is_configured:
-            raise RuntimeError("Add your OpenSubtitles details in Settings first.")
         if not self.manager.refetch_subtitles(int(job_id), self.subtitles, bool(try_another)):
             raise RuntimeError("Subtitles can only be fetched for finished downloads.")
         return "ok"
@@ -1020,18 +1012,8 @@ class AndroidCometApi:
             ]
         )
 
-    def _subtitle_session(self) -> subs.OpenSubtitlesSession:
-        if not self.subtitles.is_configured:
-            raise RuntimeError("Add your OpenSubtitles details in Settings first.")
-        if not self.subtitles.has_login:
-            raise RuntimeError("Add your OpenSubtitles username and password in Settings to download subtitles.")
-        session = subs.OpenSubtitlesSession(self.subtitles)
-        if not session.token:
-            raise RuntimeError(session.login_error or "Could not sign in to OpenSubtitles.")
-        return session
-
     def subtitle_search(self, video_path: str, languages: str = "") -> str:
-        """Subtitles on OpenSubtitles for one downloaded video, best match first. Ones that
+        """Subtitles available online for one downloaded video, best match first. Ones that
         were downloaded before carry the path of their file."""
         video = Path(video_path)
         if not video.is_file():
@@ -1052,7 +1034,6 @@ class AndroidCometApi:
         wanted = subs.parse_subtitle_languages(languages) if languages.strip() else self.subtitles.languages
         try:
             choices = subs.search_subtitles(
-                self._subtitle_session(),
                 media_type=media_type,
                 imdb_id=imdb_id,
                 video_path=video,
@@ -1060,7 +1041,7 @@ class AndroidCometApi:
                 episode=episode,
                 languages=wanted,
             )
-        except subs.OpenSubtitlesError as error:
+        except subs.SubtitleError as error:
             raise RuntimeError(str(error)) from None
         return json.dumps(
             [
@@ -1082,24 +1063,20 @@ class AndroidCometApi:
         )
 
     def subtitle_download(self, video_path: str, file_id: int, language: str) -> str:
-        """Saves one more subtitle next to the video; returns its path and the daily quota left."""
+        """Saves one more subtitle next to the video; returns its path."""
         video = Path(video_path)
         if not video.is_file():
             raise RuntimeError("The video file was moved or deleted.")
         try:
-            path, remaining = subs.download_subtitle_file(
-                self._subtitle_session(), int(file_id), language.strip().lower() or "en", video
-            )
-        except subs.OpenSubtitlesQuotaError:
-            raise RuntimeError("Daily OpenSubtitles download limit reached.") from None
-        except subs.OpenSubtitlesError as error:
+            path = subs.download_subtitle_file(int(file_id), language.strip().lower() or "en", video)
+        except subs.SubtitleError as error:
             raise RuntimeError(str(error)) from None
         except OSError as error:
             raise RuntimeError(friendly_error(error)) from None
         job = self.manager.job_for_file(video)
         if job is not None:
             self.manager.record_subtitle(job, path, int(file_id), language)
-        return json.dumps({"path": str(path), "remaining": remaining if remaining is not None else -1})
+        return json.dumps({"path": str(path)})
 
     def remove_job(self, job_id: int, delete_files: bool = False) -> bool:
         """Takes a finished download off the list, optionally deleting what it saved."""
@@ -1215,28 +1192,6 @@ class AndroidCometApi:
                 raise RuntimeError(f"{PROVIDER_LABELS.get(provider, 'The service')} rejected this token.") from None
             raise RuntimeError(friendly_error(error)) from None
         raise RuntimeError("Choose Real-Debrid or TorBox.")
-
-    def test_opensubtitles(self, api_key: str, username: str, password: str) -> str:
-        config = subs.OpenSubtitlesConfig(api_key.strip(), username.strip(), password.strip())
-        if not config.api_key:
-            raise RuntimeError("Enter an API key first.")
-        if not config.has_login:
-            raise RuntimeError("Enter your username and password too; downloads need a login.")
-        try:
-            payload = subs.opensubtitles_request(
-                config,
-                f"{subs.OPENSUBTITLES_DEFAULT_BASE_URL}/login",
-                payload={"username": config.username, "password": config.password},
-            )
-        except subs.OpenSubtitlesError as error:
-            if error.status in (400, 401, 403):
-                raise RuntimeError("OpenSubtitles rejected the API key, username or password.") from None
-            raise RuntimeError(str(error)) from None
-        # A successful sign-in clears any "rejected recently" back-off for these details.
-        subs.OPENSUBTITLES_LOGIN_FAILURES.pop((config.api_key, config.username, config.password), None)
-        user = payload.get("user") or {}
-        allowed = user.get("allowed_downloads")
-        return "Signed in" + (f" · {allowed} subtitle downloads a day" if allowed else "")
 
     def active_count(self) -> int:
         return sum(1 for job in self.manager.snapshot() if job.status in {"queued", "resolving", "downloading"})

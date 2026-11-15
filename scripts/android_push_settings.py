@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Push OpenSubtitles (and optionally debrid) settings from .env to the Android debug app.
+"""Push the subtitle languages (and optionally debrid) settings from .env to the Android debug app.
 
 The values travel over adb stdin into the app's private files dir (`run-as`, debug builds
 only), so they never show up in command lines, logs or the APK. The app imports them into
@@ -30,11 +30,7 @@ def main() -> int:
     args = parser.parse_args()
 
     env = cli.load_env_values()
-    seed = {
-        "opensubtitles_api_key": env.get(cli.OPENSUBTITLES_API_KEY_ENV_KEY, ""),
-        "opensubtitles_username": env.get(cli.OPENSUBTITLES_USERNAME_ENV_KEY, ""),
-        "opensubtitles_password": env.get(cli.OPENSUBTITLES_PASSWORD_ENV_KEY, ""),
-    }
+    seed: dict[str, str] = {}
     if env.get(cli.OPENSUBTITLES_LANGUAGES_ENV_KEY):
         seed["subtitle_languages"] = env[cli.OPENSUBTITLES_LANGUAGES_ENV_KEY]
     if args.debrid:

@@ -31,10 +31,8 @@ if _REPO_ROOT not in sys.path:  # run straight from a checkout, without the pack
 
 from comet.subtitles import (  # noqa: E402
     SUBTITLE_VIDEO_EXTENSIONS,
-    OpenSubtitlesConfig,
-    OpenSubtitlesError,
-    OpenSubtitlesQuotaError,
-    OpenSubtitlesSession,
+    SubtitleConfig,
+    SubtitleError,
     download_subtitle,
     embedded_subtitle_summary,
     episode_number_from_filename,
@@ -85,9 +83,6 @@ REALDEBRID_ENV_KEY = "REALDEBRID_API_TOKEN"
 TORBOX_ENV_KEY = "TORBOX_API_TOKEN"
 DOWNLOAD_DIR_ENV_KEY = "COMET_DOWNLOAD_DIR"
 PUBLIC_API_TOKEN_ENV_KEY = "PUBLIC_API_TOKEN"
-OPENSUBTITLES_API_KEY_ENV_KEY = "OPENSUBTITLES_API_KEY"
-OPENSUBTITLES_USERNAME_ENV_KEY = "OPENSUBTITLES_USERNAME"
-OPENSUBTITLES_PASSWORD_ENV_KEY = "OPENSUBTITLES_PASSWORD"
 OPENSUBTITLES_LANGUAGES_ENV_KEY = "OPENSUBTITLES_LANGUAGES"
 OPENSUBTITLES_ENABLED_ENV_KEY = "OPENSUBTITLES_ENABLED"
 HEALTHCHECK_TIMEOUT = 60
@@ -141,14 +136,7 @@ def redact_sensitive_text(value: str) -> str:
     redacted = re.sub(r"([?&]token=)[^&\s]+", r"\1[redacted]", redacted)
 
     env_values = load_env_values()
-    for key in (
-        REALDEBRID_ENV_KEY,
-        TORBOX_ENV_KEY,
-        PUBLIC_API_TOKEN_ENV_KEY,
-        OPENSUBTITLES_API_KEY_ENV_KEY,
-        OPENSUBTITLES_USERNAME_ENV_KEY,
-        OPENSUBTITLES_PASSWORD_ENV_KEY,
-    ):
+    for key in (REALDEBRID_ENV_KEY, TORBOX_ENV_KEY, PUBLIC_API_TOKEN_ENV_KEY):
         token = os.environ.get(key, env_values.get(key, "")).strip()
         if token:
             redacted = redacted.replace(token, "[redacted]")
@@ -322,7 +310,7 @@ class DownloadJob:
     label: str
     host: str
     candidate: StreamCandidate
-    subtitles: OpenSubtitlesConfig
+    subtitles: SubtitleConfig
     media: MediaCandidate
     season: int | None
     episode: int | None
@@ -351,7 +339,7 @@ class DownloadJob:
     subtitle_file_ids: list[int] = field(default_factory=list)
     # video file -> (its sidecar, language code), so a refetch replaces per video.
     subtitle_sidecars: dict[Path, tuple[Path, str]] = field(default_factory=dict)
-    # OpenSubtitles file id -> the sidecar it was saved as (every one fetched, also by hand).
+    # Subtitle file id -> the sidecar it was saved as (every one fetched, also by hand).
     subtitle_files: dict[int, Path] = field(default_factory=dict)
     cancel_event: threading.Event = field(default_factory=threading.Event, repr=False)
 
@@ -1444,7 +1432,7 @@ class DownloadManager:
         label: str,
         host: str,
         candidate: StreamCandidate,
-        subtitles: OpenSubtitlesConfig,
+        subtitles: SubtitleConfig,
         media: MediaCandidate,
         season: int | None,
         episode: int | None,
@@ -1601,7 +1589,7 @@ class DownloadManager:
             # on the job but must not turn a finished download into a failed one.
             try:
                 self.update_job(job_id, embedded_subtitles=embedded_subtitle_summary(destinations))
-                if job.subtitles.is_configured:
+                if job.subtitles.enabled:
                     reporter.set_downloading_subtitles()
                     result = self._run_subtitles(job, destinations, job.subtitles)
                     destinations.extend(path for path in result.paths if path not in destinations)
@@ -1643,7 +1631,7 @@ class DownloadManager:
         self,
         job: DownloadJob,
         video_paths: list[Path],
-        config: OpenSubtitlesConfig,
+        config: SubtitleConfig,
         *,
         manual: bool = False,
         exclude: set[int] | None = None,
@@ -1666,7 +1654,7 @@ class DownloadManager:
         self._emit(level, f"Subtitles for job #{job.job_id}: {result.message}")
         return result
 
-    def refetch_subtitles(self, job_id: int, config: OpenSubtitlesConfig, try_another: bool) -> bool:
+    def refetch_subtitles(self, job_id: int, config: SubtitleConfig, try_another: bool) -> bool:
         """Re-runs the subtitle lookup for a finished job in the background. With
         [try_another], subtitles picked before are skipped and the old sidecars replaced."""
         with self._lock:
@@ -2103,43 +2091,13 @@ def load_debrid_config(provider_override: str | None, cli_token: str | None) -> 
     )
 
 
-def load_opensubtitles_config() -> OpenSubtitlesConfig:
+def load_subtitle_config() -> SubtitleConfig:
+    """Subtitles need no account: they are on unless the .env turns them off."""
     env_values = load_env_values()
-    api_key = configured_env_value(env_values, OPENSUBTITLES_API_KEY_ENV_KEY)
-    username = configured_env_value(env_values, OPENSUBTITLES_USERNAME_ENV_KEY)
-    password = configured_env_value(env_values, OPENSUBTITLES_PASSWORD_ENV_KEY)
-    languages = parse_subtitle_languages(env_values.get(OPENSUBTITLES_LANGUAGES_ENV_KEY))
-
-    if opensubtitles_disabled(env_values):
-        return OpenSubtitlesConfig(api_key="", username="", password="", languages=languages)
-
-    if api_key and username and password:
-        return OpenSubtitlesConfig(api_key=api_key, username=username, password=password, languages=languages)
-
-    if not sys.stdin.isatty():
-        return OpenSubtitlesConfig(api_key=api_key, username=username, password=password, languages=languages)
-
-    UI.info("Subtitle downloads are optional and need an OpenSubtitles API key, username, and password.")
-    if not api_key:
-        api_key = UI.prompt("OpenSubtitles API key (leave blank to skip subtitles): ").strip()
-        if not api_key:
-            # Remember the answer, otherwise these three prompts come back on every start.
-            upsert_env_value(ENV_PATH, OPENSUBTITLES_ENABLED_ENV_KEY, "false")
-            UI.info(
-                f"Subtitles are off. Remove {OPENSUBTITLES_ENABLED_ENV_KEY} from {ENV_PATH} to set them up later."
-            )
-            return OpenSubtitlesConfig(api_key="", username="", password="", languages=languages)
-    if not username:
-        username = UI.prompt("OpenSubtitles username: ").strip()
-    if not password:
-        password = UI.prompt("OpenSubtitles password: ").strip()
-
-    if api_key and username and password:
-        upsert_env_value(ENV_PATH, OPENSUBTITLES_API_KEY_ENV_KEY, api_key)
-        upsert_env_value(ENV_PATH, OPENSUBTITLES_USERNAME_ENV_KEY, username)
-        upsert_env_value(ENV_PATH, OPENSUBTITLES_PASSWORD_ENV_KEY, password)
-
-    return OpenSubtitlesConfig(api_key=api_key, username=username, password=password, languages=languages)
+    return SubtitleConfig(
+        languages=parse_subtitle_languages(env_values.get(OPENSUBTITLES_LANGUAGES_ENV_KEY)),
+        enabled=not opensubtitles_disabled(env_values),
+    )
 
 
 def opensubtitles_disabled(env_values: dict[str, str]) -> bool:
@@ -3071,7 +3029,7 @@ def build_subtitle_targets(job: DownloadJob, video_paths: list[Path]) -> list[tu
     if not videos:
         return []
     if job.media.media_type == "movie":
-        # Only the main feature: extras would just burn download quota.
+        # Only the main feature: extras get no subtitle of their own.
         return [(max(videos, key=lambda path: path.stat().st_size), None, None)]
     if job.episode is not None and len(videos) == 1:
         return [(videos[0], job.season, job.episode)]
@@ -3111,7 +3069,7 @@ def download_subtitles_for_job(
     job: DownloadJob,
     video_paths: list[Path],
     *,
-    config: OpenSubtitlesConfig | None = None,
+    config: SubtitleConfig | None = None,
     honour_embedded: bool = True,
     exclude: set[int] | None = None,
     keep: dict[Path, str] | None = None,
@@ -3123,19 +3081,12 @@ def download_subtitles_for_job(
     Never raises: problems are reported on the job, the download stands."""
     config = config or job.subtitles
     keep = keep or {}
-    if not config.has_login:
-        # Searching works with just the key, but OpenSubtitles refuses downloads without a login.
-        return SubtitleResult("failed", "Add your OpenSubtitles username and password to get subtitles")
     try:
         targets = build_subtitle_targets(job, video_paths)
     except OSError:
         targets = []
     if not targets:
         return SubtitleResult("missing", "No video file to match subtitles to")
-    try:
-        session = OpenSubtitlesSession(config)
-    except Exception as error:  # pragma: no cover - defensive
-        return SubtitleResult("failed", str(error))
 
     paths: list[Path] = []
     file_ids: list[int] = []
@@ -3164,7 +3115,6 @@ def download_subtitles_for_job(
             continue
         try:
             choice = find_subtitle(
-                session,
                 media_type=job.media.media_type,
                 imdb_id=job.media.imdb_id,
                 video_path=video_path,
@@ -3179,23 +3129,16 @@ def download_subtitles_for_job(
                     covered_languages.append(embedded_best)
                     handled.add(video_path)
                 continue
-            paths.append(download_subtitle(session, choice, video_path, overwrite=not honour_embedded))
+            paths.append(download_subtitle(choice, video_path, overwrite=not honour_embedded))
             file_ids.append(choice.file_id)
             videos.append(video_path)
             sidecar_languages.append(choice.language)
             covered_languages.append(choice.language)
             handled.add(video_path)
-        except OpenSubtitlesQuotaError:
-            problem = "Daily OpenSubtitles download limit reached"
-            break
-        except OpenSubtitlesError as error:
-            if error.status == 401 and not session.token:
-                problem = session.login_error or "OpenSubtitles needs you to sign in to download"
+        except SubtitleError as error:
+            problem = str(error).rstrip(".")
+            if error.status == 429:
                 break
-            if error.status in (401, 403) and not session.login_error:
-                problem = "OpenSubtitles rejected the API key"
-                break
-            problem = str(error)
         except Exception as error:
             problem = f"Subtitle error: {error.__class__.__name__}"
 
@@ -3254,7 +3197,7 @@ def queue_download_for_query(
     *,
     host: str,
     debrid: DebridConfig,
-    subtitles: OpenSubtitlesConfig,
+    subtitles: SubtitleConfig,
     base_output_dir: Path,
     manager: DownloadManager,
     query: str,
@@ -3347,7 +3290,7 @@ def main() -> None:
     args = parse_args()
     restrict_env_permissions(ENV_PATH)
     debrid = load_debrid_config(args.provider, args.token)
-    subtitles = load_opensubtitles_config()
+    subtitles = load_subtitle_config()
     base_output_dir, output_saved = resolve_output_dir(args.output_dir)
     manager = DownloadManager(args.parallel_downloads, event_callback=emit_ui_event)
     UI.bind_download_manager(manager)
@@ -3367,14 +3310,12 @@ def main() -> None:
             f"Using {debrid.label}. Download queue ready. Running up to {args.parallel_downloads} download"
             f"{'s' if args.parallel_downloads != 1 else ''} at once."
         )
-        if subtitles.is_configured:
-            UI.info(f"OpenSubtitles subtitles enabled ({_language_list(subtitles.languages)}, first found wins).")
-        elif opensubtitles_disabled(load_env_values()):
-            UI.info(f"Subtitles are off ({OPENSUBTITLES_ENABLED_ENV_KEY}=false in {ENV_PATH}).")
+        if subtitles.enabled:
+            UI.info(f"Subtitles on ({_language_list(subtitles.languages)}, first found wins).")
         else:
-            UI.warning(
-                "OpenSubtitles is not configured; set OPENSUBTITLES_API_KEY, "
-                "OPENSUBTITLES_USERNAME, and OPENSUBTITLES_PASSWORD to enable subtitles."
+            UI.info(
+                f"Subtitles are off ({OPENSUBTITLES_ENABLED_ENV_KEY}=false in {ENV_PATH}). "
+                "Remove that line to turn them on; no account is needed."
             )
 
         query_override = args.query

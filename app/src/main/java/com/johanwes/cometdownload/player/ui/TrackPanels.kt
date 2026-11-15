@@ -274,16 +274,6 @@ fun SubtitlesPanel(viewModel: PlayerViewModel) {
                 }
             }
         }
-        if (viewModel.quotaRemaining >= 0) {
-            item(key = "quota") {
-                Text(
-                    "${viewModel.quotaRemaining} downloads left today",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = MaterialTheme.colorScheme.onSurfaceVariant,
-                    modifier = Modifier.padding(horizontal = 20.dp, vertical = 12.dp),
-                )
-            }
-        }
     }
 }
 
