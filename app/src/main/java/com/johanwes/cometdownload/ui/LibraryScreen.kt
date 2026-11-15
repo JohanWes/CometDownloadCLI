@@ -67,6 +67,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.BiasAlignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.graphics.vector.ImageVector
@@ -126,6 +127,7 @@ fun LibraryScreen(viewModel: CometViewModel, showSettingsAction: Boolean, gridSt
 @Composable
 private fun LibraryFront(viewModel: CometViewModel, showSettingsAction: Boolean, gridState: LazyGridState) {
     val context = LocalContext.current
+    val flood = LocalPlayFlood.current
     val library = viewModel.library
     // Everything that isn't in the library (yet): running and queued first, then what stopped short.
     val downloads = viewModel.jobs
@@ -267,7 +269,7 @@ private fun LibraryFront(viewModel: CometViewModel, showSettingsAction: Boolean,
                         items(continueWatching, key = { it.key }) { title ->
                             ContinueCard(
                                 title = title,
-                                onClick = { playFromLibrary(context, viewModel, title) },
+                                onClick = { from -> playFromLibrary(context, viewModel, title, flood = flood, from = from) },
                                 modifier = Modifier.animateItem(),
                             )
                         }
@@ -321,12 +323,16 @@ private fun sortName(name: String): String =
 /**
  * Plays [episode] of [title] (by default what is next up). A show plays on into its following
  * episodes; a movie that is there in two versions plays only the one picked.
+ *
+ * Given a [flood] and where on screen the tap was ([from]), the player opens out of that spot.
  */
 internal fun playFromLibrary(
     context: Context,
     viewModel: CometViewModel,
     title: LibraryTitle,
     episode: LibraryEpisode? = title.nextUp ?: title.episodes.firstOrNull(),
+    flood: PlayFlood? = null,
+    from: Offset? = null,
 ) {
     episode ?: return
     if (!File(episode.path).exists()) {
@@ -334,13 +340,17 @@ internal fun playFromLibrary(
         return
     }
     val playlist = if (title.isSeries) title.episodes else listOf(episode)
-    PlayerActivity.start(
-        context = context,
-        paths = playlist.map { it.path },
-        labels = playlist.map { it.label },
-        index = playlist.indexOfFirst { it.path == episode.path },
-        title = title.name,
-    )
+    val open = { covered: Boolean ->
+        PlayerActivity.start(
+            context = context,
+            paths = playlist.map { it.path },
+            labels = playlist.map { it.label },
+            index = playlist.indexOfFirst { it.path == episode.path },
+            title = title.name,
+            covered = covered,
+        )
+    }
+    if (flood != null && from != null) flood.launch(from) { open(true) } else open(false)
 }
 
 /** Something that is only done after the user confirmed it. */
@@ -545,14 +555,16 @@ internal fun WatchBar(progress: Float, modifier: Modifier = Modifier) {
 
 /** A started movie or show as a wide card; a tap carries on where it stopped. */
 @Composable
-private fun ContinueCard(title: LibraryTitle, onClick: () -> Unit, modifier: Modifier = Modifier) {
+private fun ContinueCard(title: LibraryTitle, onClick: (from: Offset?) -> Unit, modifier: Modifier = Modifier) {
     val colors = MaterialTheme.colorScheme
     val next = title.nextUp
+    // The play mark, which the player opens out of.
+    val playSpot = rememberSpot()
     Column(
         modifier
             .width(220.dp)
             .clip(MaterialTheme.shapes.small)
-            .clickable(onClickLabel = "Play", onClick = onClick),
+            .clickable(onClickLabel = "Play", onClick = { onClick(playSpot.center) }),
         verticalArrangement = Arrangement.spacedBy(2.dp),
     ) {
         Box(
@@ -570,7 +582,7 @@ private fun ContinueCard(title: LibraryTitle, onClick: () -> Unit, modifier: Mod
                 shape = CircleShape,
                 color = Color.Black.copy(alpha = 0.55f),
                 contentColor = Color.White,
-                modifier = Modifier.align(Alignment.Center),
+                modifier = Modifier.align(Alignment.Center).spot(playSpot),
             ) {
                 Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.padding(8.dp).size(28.dp))
             }

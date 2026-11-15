@@ -93,6 +93,7 @@ fun CometApp(viewModel: CometViewModel, onExit: () -> Unit) {
         val activeCount = viewModel.jobs.count { it.isActive }
         val anchors = remember { Anchors() }
         val flight = remember { DownloadFlight() }
+        val flood = remember { PlayFlood() }
 
         LifecycleStartEffect(viewModel) {
             viewModel.setVisible(true)
@@ -144,7 +145,11 @@ fun CometApp(viewModel: CometViewModel, onExit: () -> Unit) {
             }
         }
 
-        CompositionLocalProvider(LocalAnchors provides anchors, LocalDownloadFlight provides flight) {
+        CompositionLocalProvider(
+            LocalAnchors provides anchors,
+            LocalDownloadFlight provides flight,
+            LocalPlayFlood provides flood,
+        ) {
         Box(Modifier.fillMaxSize()) {
         Scaffold(
             containerColor = MaterialTheme.colorScheme.background,
@@ -256,6 +261,7 @@ fun CometApp(viewModel: CometViewModel, onExit: () -> Unit) {
         }
 
         DownloadFlightOverlay(flight, target = anchors[tabAnchor(Tab.Library)])
+        PlayFloodOverlay(flood)
         }
         }
     }

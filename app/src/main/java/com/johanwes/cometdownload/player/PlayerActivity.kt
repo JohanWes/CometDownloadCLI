@@ -1,5 +1,6 @@
 package com.johanwes.cometdownload.player
 
+import android.app.ActivityOptions
 import android.content.Context
 import android.content.Intent
 import android.content.pm.ActivityInfo
@@ -30,6 +31,10 @@ class PlayerActivity : ComponentActivity() {
             navigationBarStyle = SystemBarStyle.dark(Color.TRANSPARENT),
         )
         super.onCreate(savedInstanceState)
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            // Leaving fades back to the app, as arriving faded out of it.
+            overrideActivityTransition(OVERRIDE_TRANSITION_CLOSE, android.R.anim.fade_in, android.R.anim.fade_out)
+        }
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
             // Use the whole screen, also beside a camera cut-out; controls keep clear of it.
             window.attributes = window.attributes.apply {
@@ -61,6 +66,14 @@ class PlayerActivity : ComponentActivity() {
                 }
                 PlayerScreen(viewModel = viewModel, onClose = ::finish)
             }
+        }
+    }
+
+    override fun finish() {
+        super.finish()
+        if (Build.VERSION.SDK_INT < Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+            @Suppress("DEPRECATION")
+            overridePendingTransition(android.R.anim.fade_in, android.R.anim.fade_out)
         }
     }
 
@@ -104,14 +117,30 @@ class PlayerActivity : ComponentActivity() {
         /**
          * Plays [paths] (the episodes of one title) starting with the one at [index]. [labels]
          * says what each one is ("S1 E2 · Cat's in the Bag..."), blank where that is unknown.
+         *
+         * [covered] says the screen has been flooded black already (see PlayFlood): the player,
+         * black itself, then simply takes over. Otherwise it fades in.
          */
-        fun start(context: Context, paths: List<String>, labels: List<String>, index: Int, title: String) {
+        fun start(
+            context: Context,
+            paths: List<String>,
+            labels: List<String>,
+            index: Int,
+            title: String,
+            covered: Boolean = false,
+        ) {
+            val transition = if (covered) {
+                ActivityOptions.makeCustomAnimation(context, 0, 0)
+            } else {
+                ActivityOptions.makeCustomAnimation(context, android.R.anim.fade_in, android.R.anim.fade_out)
+            }
             context.startActivity(
                 Intent(context, PlayerActivity::class.java)
                     .putStringArrayListExtra(EXTRA_PATHS, ArrayList(paths))
                     .putStringArrayListExtra(EXTRA_LABELS, ArrayList(labels))
                     .putExtra(EXTRA_INDEX, index)
                     .putExtra(EXTRA_TITLE, title),
+                transition.toBundle(),
             )
         }
     }

@@ -56,6 +56,7 @@ import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.LocalContext
@@ -82,6 +83,7 @@ import com.johanwes.cometdownload.resolutionTag
 @Composable
 fun LibraryTitleScreen(viewModel: CometViewModel, title: LibraryTitle, paneColor: Color) {
     val context = LocalContext.current
+    val flood = LocalPlayFlood.current
     val listState = rememberLazyListState()
     val statusTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val backdropHeight = 230.dp + statusTop
@@ -114,7 +116,7 @@ fun LibraryTitleScreen(viewModel: CometViewModel, title: LibraryTitle, paneColor
             item(key = "play") {
                 PlayBlock(
                     title = title,
-                    onPlay = { playFromLibrary(context, viewModel, title) },
+                    onPlay = { from -> playFromLibrary(context, viewModel, title, flood = flood, from = from) },
                     modifier = Modifier.centered().padding(start = 16.dp, end = 16.dp, top = 20.dp),
                 )
             }
@@ -149,7 +151,7 @@ fun LibraryTitleScreen(viewModel: CometViewModel, title: LibraryTitle, paneColor
                         highlighted = episode.path == next?.path,
                         illustrated = illustrated,
                         deleteLabel = "Delete episode",
-                        onPlay = { playFromLibrary(context, viewModel, title, episode) },
+                        onPlay = { from -> playFromLibrary(context, viewModel, title, episode, flood, from) },
                         onSetWatched = { watched -> viewModel.setWatched(listOf(episode), watched) },
                         onOpenElsewhere = { openInOtherApp(context, episode.path)?.let(viewModel::showMessage) },
                         onDelete = {
@@ -191,7 +193,7 @@ fun LibraryTitleScreen(viewModel: CometViewModel, title: LibraryTitle, paneColor
                         highlighted = version.path == next?.path,
                         illustrated = false,
                         deleteLabel = "Delete this version",
-                        onPlay = { playFromLibrary(context, viewModel, title, version) },
+                        onPlay = { from -> playFromLibrary(context, viewModel, title, version, flood, from) },
                         onSetWatched = { watched -> viewModel.setWatched(listOf(version), watched) },
                         onOpenElsewhere = { openInOtherApp(context, version.path)?.let(viewModel::showMessage) },
                         onDelete = {
@@ -271,8 +273,9 @@ private fun seasonName(season: Int): String = if (season > 0) "Season $season" e
 
 /** The main button (resume, play the next episode, play again) and what is on the device. */
 @Composable
-private fun PlayBlock(title: LibraryTitle, onPlay: () -> Unit, modifier: Modifier = Modifier) {
+private fun PlayBlock(title: LibraryTitle, onPlay: (from: Offset?) -> Unit, modifier: Modifier = Modifier) {
     val next = title.nextUp
+    val buttonSpot = rememberSpot()
     val label = when {
         next == null -> "Play again"
         next.inProgress -> listOf("Resume", next.tag.takeIf { title.isSeries }.orEmpty(), "·", formatTime(next.positionMs))
@@ -282,9 +285,9 @@ private fun PlayBlock(title: LibraryTitle, onPlay: () -> Unit, modifier: Modifie
     }
     Column(modifier, verticalArrangement = Arrangement.spacedBy(10.dp)) {
         Button(
-            onClick = onPlay,
+            onClick = { onPlay(buttonSpot.center) },
             contentPadding = ButtonDefaults.ButtonWithIconContentPadding,
-            modifier = Modifier.widthIn(max = 360.dp).fillMaxWidth().height(48.dp),
+            modifier = Modifier.widthIn(max = 360.dp).fillMaxWidth().height(48.dp).spot(buttonSpot),
         ) {
             Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.size(20.dp))
             Spacer(Modifier.size(8.dp))
@@ -402,7 +405,7 @@ private fun VideoRow(
     highlighted: Boolean,
     illustrated: Boolean,
     deleteLabel: String,
-    onPlay: () -> Unit,
+    onPlay: (from: Offset?) -> Unit,
     onSetWatched: (Boolean) -> Unit,
     onOpenElsewhere: () -> Unit,
     onDelete: () -> Unit,
@@ -410,8 +413,10 @@ private fun VideoRow(
 ) {
     val colors = MaterialTheme.colorScheme
     val file = fileName(video.path)
+    // What the row leads with (still or number), which the player opens out of.
+    val leadSpot = rememberSpot()
     Surface(
-        onClick = onPlay,
+        onClick = { onPlay(leadSpot.center) },
         // What plays next stands out, so the place in a season is found at a glance.
         color = if (highlighted) glassFill() else Color.Transparent,
         border = if (highlighted) glassRim() else null,
@@ -425,13 +430,18 @@ private fun VideoRow(
                 horizontalArrangement = Arrangement.spacedBy(12.dp),
             ) {
                 if (illustrated) {
-                    EpisodeStill(video = video, number = number, upNext = highlighted, modifier = Modifier.width(StillWidth))
+                    EpisodeStill(
+                        video = video,
+                        number = number,
+                        upNext = highlighted,
+                        modifier = Modifier.width(StillWidth).spot(leadSpot),
+                    )
                 } else {
                     AnimatedContent(
                         targetState = video.watched,
                         transitionSpec = { IconSwap },
                         contentAlignment = Alignment.Center,
-                        modifier = Modifier.width(32.dp),
+                        modifier = Modifier.width(32.dp).spot(leadSpot),
                         label = "watched",
                     ) { watched ->
                         when {
