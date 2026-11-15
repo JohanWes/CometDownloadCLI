@@ -74,8 +74,9 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.BiasAlignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clipToBounds
-import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.draw.drawWithCache
 import androidx.compose.ui.draw.shadow
+import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.graphics.BlendMode
 import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
@@ -229,11 +230,6 @@ internal fun TitleHeader(
             // Darken the top for the bar icons, and let the bottom dissolve into the page: it is
             // faded out rather than painted over, because the page behind it is not one colour.
             val shade = Brush.verticalGradient(0f to Color.Black.copy(alpha = 0.6f), 0.3f to Color.Transparent)
-            val dissolve = Brush.verticalGradient(
-                0.3f to Color.Black,
-                0.55f to Color.Black.copy(alpha = 0.5f),
-                1f to Color.Transparent,
-            )
             Box(
                 Modifier
                     .fillMaxWidth()
@@ -241,10 +237,21 @@ internal fun TitleHeader(
                     // Crop scaling overflows the box on wide panes; keep it inside.
                     .clipToBounds()
                     .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
-                    .drawWithContent {
-                        drawContent()
-                        drawRect(shade)
-                        drawRect(dissolve, blendMode = BlendMode.DstIn)
+                    .drawWithCache {
+                        val dissolve = Brush.verticalGradient(
+                            0.3f to Color.Black,
+                            0.55f to Color.Black.copy(alpha = 0.5f),
+                            1f to Color.Transparent,
+                        )
+                        // The very end of a gradient is not transparent on every renderer, which
+                        // left the picture's last row standing as a hairline: wipe the tail.
+                        val tail = 1.dp.toPx().coerceAtLeast(2f)
+                        onDrawWithContent {
+                            drawContent()
+                            drawRect(shade)
+                            drawRect(dissolve, blendMode = BlendMode.DstIn)
+                            drawRect(Color.Black, topLeft = Offset(0f, size.height - tail), blendMode = BlendMode.Clear)
+                        }
                     },
             ) {
                 if (background.isNotBlank()) {
