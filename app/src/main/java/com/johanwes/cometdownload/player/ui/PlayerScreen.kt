@@ -9,6 +9,7 @@ import androidx.activity.compose.BackHandler
 import androidx.annotation.OptIn
 import androidx.compose.animation.AnimatedVisibility
 import androidx.compose.animation.fadeIn
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.fadeOut
 import androidx.compose.foundation.background
 import androidx.compose.foundation.focusable
@@ -18,9 +19,10 @@ import androidx.compose.foundation.gestures.calculateZoom
 import androidx.compose.foundation.gestures.detectTapGestures
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.Row
-import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
@@ -64,8 +66,12 @@ import androidx.compose.ui.input.key.type
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChange
 import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.Dp
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.text.Cue
@@ -96,8 +102,13 @@ private data class Feedback(
 @Composable
 fun PlayerScreen(viewModel: PlayerViewModel, onClose: () -> Unit) {
     val context = LocalContext.current
-    var controlsVisible by remember { mutableStateOf(true) }
+    // A video starts with the picture, not with the controls over it; see the title card below.
+    var controlsVisible by remember { mutableStateOf(false) }
     var panel by remember { mutableStateOf<Panel?>(null) }
+    // The name of what is playing, shown alone for a moment when a video starts.
+    var titleCard by remember { mutableStateOf(false) }
+    var screenSize by remember { mutableStateOf(IntSize.Zero) }
+    var panelSize by remember { mutableStateOf(IntSize.Zero) }
     // Bumped on every touch of the controls, which restarts the auto-hide countdown.
     var interactions by remember { mutableIntStateOf(0) }
     var feedback by remember { mutableStateOf<Feedback?>(null) }
@@ -113,6 +124,17 @@ fun PlayerScreen(viewModel: PlayerViewModel, onClose: () -> Unit) {
     }
     LaunchedEffect(viewModel.ended, viewModel.error) {
         if (viewModel.ended || viewModel.error != null) controlsVisible = true
+    }
+    // At the start, and again each time the next episode begins.
+    LaunchedEffect(viewModel.index) {
+        titleCard = true
+        delay(TITLE_CARD_MS)
+        titleCard = false
+    }
+    // Nothing left to play: back to the page the video was started from, which now offers
+    // what comes next.
+    LaunchedEffect(viewModel.finished) {
+        if (viewModel.finished) onClose()
     }
     // Also when paused from outside (headset button, a call): show where playback stopped.
     LaunchedEffect(viewModel.isPlaying) {
@@ -139,10 +161,23 @@ fun PlayerScreen(viewModel: PlayerViewModel, onClose: () -> Unit) {
         skipped = if (skipped * direction > 0) skipped + step else step
     }
 
+    // While subtitles are being adjusted they have to stay in view: beside the panel in
+    // landscape (the text moves over), above it in portrait (the picture moves up with it).
+    val adjusting = panel == Panel.Subtitles
+    val landscape = screenSize.width > screenSize.height
+    val (besidePanel, abovePanel) = with(LocalDensity.current) {
+        when {
+            !adjusting -> 0.dp to 0.dp
+            landscape -> panelSize.width.toDp() to 0.dp
+            else -> 0.dp to panelSize.height.toDp()
+        }
+    }
+
     Box(
         Modifier
             .fillMaxSize()
             .background(Color.Black)
+            .onSizeChanged { screenSize = it }
             .focusRequester(focus)
             .focusable()
             .onKeyEvent { event ->
@@ -156,20 +191,23 @@ fun PlayerScreen(viewModel: PlayerViewModel, onClose: () -> Unit) {
                 true
             },
     ) {
-        ContentFrame(
-            player = viewModel.player,
-            modifier = Modifier.fillMaxSize(),
-            surfaceType = SURFACE_TYPE_SURFACE_VIEW,
-            contentScale = if (viewModel.zoomed) ContentScale.Crop else ContentScale.Fit,
-            keepContentOnReset = true,
-        )
+        Box(Modifier.fillMaxSize().padding(bottom = abovePanel)) {
+            ContentFrame(
+                player = viewModel.player,
+                modifier = Modifier.fillMaxSize(),
+                surfaceType = SURFACE_TYPE_SURFACE_VIEW,
+                contentScale = if (viewModel.zoomed) ContentScale.Crop else ContentScale.Fit,
+                keepContentOnReset = true,
+            )
 
-        SubtitleLayer(
-            cues = viewModel.cues,
-            videoAspect = viewModel.videoAspect,
-            scale = viewModel.subtitleScale,
-            raised = controlsVisible && panel == null,
-        )
+            SubtitleLayer(
+                cues = viewModel.cues,
+                videoAspect = viewModel.videoAspect,
+                scale = viewModel.subtitleScale,
+                raised = controlsVisible && panel == null,
+                covered = besidePanel,
+            )
+        }
 
         GestureLayer(
             onTap = {
@@ -197,6 +235,14 @@ fun PlayerScreen(viewModel: PlayerViewModel, onClose: () -> Unit) {
         }
 
         AnimatedVisibility(
+            visible = titleCard && !controlsVisible && panel == null && viewModel.error == null,
+            enter = fadeIn(tween(TITLE_CARD_FADE_MS)),
+            exit = fadeOut(tween(TITLE_CARD_FADE_MS)),
+        ) {
+            TitleCard(viewModel)
+        }
+
+        AnimatedVisibility(
             visible = controlsVisible && panel == null && viewModel.error == null,
             enter = fadeIn(),
             exit = fadeOut(),
@@ -221,7 +267,7 @@ fun PlayerScreen(viewModel: PlayerViewModel, onClose: () -> Unit) {
             )
         }
 
-        PanelHost(panel = panel, onDismiss = { panel = null }) { open ->
+        PanelHost(panel = panel, onDismiss = { panel = null }, onSize = { panelSize = it }) { open ->
             when (open) {
                 Panel.Subtitles -> SubtitlesPanel(viewModel)
                 Panel.Audio -> AudioPanel(viewModel)
@@ -235,36 +281,46 @@ fun PlayerScreen(viewModel: PlayerViewModel, onClose: () -> Unit) {
 /**
  * Subtitles over the picture. Picture-based ones (PGS, styled ASS) are drawn for the exact video
  * area; plain text gets at least a 16:9 box, so it keeps a readable size on very wide films.
+ *
+ * [covered] is how much of the right side a panel hides. The subtitles move into what is left:
+ * text keeps its size and wraps sooner, pictures get smaller as a whole.
  */
 @OptIn(UnstableApi::class)
 @Composable
-private fun SubtitleLayer(cues: List<Cue>, videoAspect: Float, scale: Float, raised: Boolean) {
+private fun SubtitleLayer(cues: List<Cue>, videoAspect: Float, scale: Float, raised: Boolean, covered: Dp) {
     val pictures = cues.any { it.bitmap != null }
-    val aspect = if (pictures) videoAspect else minOf(videoAspect, 16f / 9f)
-    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
-        AndroidView(
-            factory = { context ->
-                SubtitleView(context).apply {
-                    setStyle(
-                        CaptionStyleCompat(
-                            android.graphics.Color.WHITE,
-                            android.graphics.Color.TRANSPARENT,
-                            android.graphics.Color.TRANSPARENT,
-                            CaptionStyleCompat.EDGE_TYPE_OUTLINE,
-                            android.graphics.Color.BLACK,
-                            Typeface.create("sans-serif-medium", Typeface.NORMAL),
-                        ),
-                    )
-                }
-            },
-            update = { view ->
-                view.setFractionalTextSize(SubtitleView.DEFAULT_TEXT_SIZE_FRACTION * scale)
-                // Clear of the seek bar while the controls are up.
-                view.setBottomPaddingFraction(if (raised) RAISED_SUBTITLE_PADDING else SubtitleView.DEFAULT_BOTTOM_PADDING_FRACTION)
-                view.setCues(cues)
-            },
-            modifier = Modifier.aspectRatio(aspect.coerceIn(0.2f, 5f)),
-        )
+    val aspect = (if (pictures) videoAspect else minOf(videoAspect, 16f / 9f)).coerceIn(0.2f, 5f)
+    BoxWithConstraints(Modifier.fillMaxSize()) {
+        // The box as it fits the screen, then narrowed to the part that is in view.
+        val fitWidth = minOf(maxWidth, maxHeight * aspect)
+        val inView = (maxWidth - covered).coerceAtLeast(0.dp)
+        val width = minOf(fitWidth, inView)
+        val height = if (pictures) width / aspect else fitWidth / aspect
+        Box(Modifier.width(inView).fillMaxHeight(), contentAlignment = Alignment.Center) {
+            AndroidView(
+                factory = { context ->
+                    SubtitleView(context).apply {
+                        setStyle(
+                            CaptionStyleCompat(
+                                android.graphics.Color.WHITE,
+                                android.graphics.Color.TRANSPARENT,
+                                android.graphics.Color.TRANSPARENT,
+                                CaptionStyleCompat.EDGE_TYPE_OUTLINE,
+                                android.graphics.Color.BLACK,
+                                Typeface.create("sans-serif-medium", Typeface.NORMAL),
+                            ),
+                        )
+                    }
+                },
+                update = { view ->
+                    view.setFractionalTextSize(SubtitleView.DEFAULT_TEXT_SIZE_FRACTION * scale)
+                    // Clear of the seek bar while the controls are up.
+                    view.setBottomPaddingFraction(if (raised) RAISED_SUBTITLE_PADDING else SubtitleView.DEFAULT_BOTTOM_PADDING_FRACTION)
+                    view.setCues(cues)
+                },
+                modifier = Modifier.size(width, height),
+            )
+        }
     }
 }
 
@@ -478,6 +534,8 @@ private fun ErrorOverlay(message: String, onRetry: () -> Unit, onOpenElsewhere: 
 }
 
 private const val CONTROLS_TIMEOUT_MS = 3500L
+private const val TITLE_CARD_MS = 4000L
+private const val TITLE_CARD_FADE_MS = 500
 private const val SKIP_FEEDBACK_MS = 700L
 private const val FEEDBACK_MS = 900L
 private const val RAISED_SUBTITLE_PADDING = 0.3f

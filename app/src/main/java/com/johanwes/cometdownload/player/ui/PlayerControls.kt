@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
 import androidx.compose.foundation.layout.ExperimentalLayoutApi
 import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.displayCutout
 import androidx.compose.foundation.layout.fillMaxSize
@@ -117,9 +118,9 @@ fun PlayerControls(
                     .windowInsetsPadding(WindowInsets.displayCutout.union(WindowInsets.systemBarsIgnoringVisibility))
                     .padding(horizontal = 12.dp, vertical = 4.dp),
             ) {
-                TopBar(
+                TitleBar(
                     title = viewModel.title.ifBlank { viewModel.current?.fileName.orEmpty() },
-                    subtitle = listOfNotNull(viewModel.current?.episodeTag, chapter?.title).joinToString(" · "),
+                    subtitle = listOfNotNull(viewModel.current?.label?.ifBlank { null }, chapter?.title).joinToString(" · "),
                     onClose = onClose,
                     modifier = Modifier.align(Alignment.TopStart),
                 )
@@ -183,11 +184,42 @@ fun PlayerControls(
     }
 }
 
+/**
+ * Only the name of what is playing, over a light shade at the top: shown for a moment when a
+ * video starts, so the picture isn't covered by the controls and a new episode says which it is.
+ * The text sits where the controls show it, so bringing those up doesn't move it.
+ */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
-private fun TopBar(title: String, subtitle: String, onClose: () -> Unit, modifier: Modifier = Modifier) {
+fun TitleCard(viewModel: PlayerViewModel, modifier: Modifier = Modifier) {
+    CompositionLocalProvider(LocalContentColor provides Color.White) {
+        Box(
+            modifier
+                .fillMaxWidth()
+                .background(Brush.verticalGradient(0f to Color.Black.copy(alpha = 0.6f), 1f to Color.Transparent))
+                .windowInsetsPadding(WindowInsets.displayCutout.union(WindowInsets.systemBarsIgnoringVisibility))
+                .padding(horizontal = 12.dp, vertical = 4.dp)
+                .padding(bottom = 56.dp),
+        ) {
+            TitleBar(
+                title = viewModel.title.ifBlank { viewModel.current?.fileName.orEmpty() },
+                subtitle = viewModel.current?.label.orEmpty(),
+                onClose = null,
+            )
+        }
+    }
+}
+
+/** The title and, below it, which episode (and chapter) this is. Without [onClose] no back arrow. */
+@Composable
+private fun TitleBar(title: String, subtitle: String, onClose: (() -> Unit)?, modifier: Modifier = Modifier) {
     Row(modifier.fillMaxWidth(), verticalAlignment = Alignment.CenterVertically) {
-        IconButton(onClick = onClose) {
-            Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+        if (onClose != null) {
+            IconButton(onClick = onClose) {
+                Icon(Icons.AutoMirrored.Filled.ArrowBack, contentDescription = "Back")
+            }
+        } else {
+            Spacer(Modifier.size(48.dp))
         }
         Column(Modifier.padding(start = 4.dp).weight(1f)) {
             Text(title, style = MaterialTheme.typography.titleMedium, maxLines = 1, overflow = TextOverflow.Ellipsis)

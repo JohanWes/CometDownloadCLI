@@ -56,7 +56,9 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.unit.IntSize
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.johanwes.cometdownload.Load
@@ -74,7 +76,12 @@ import kotlin.math.roundToInt
  */
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
-fun PanelHost(panel: Panel?, onDismiss: () -> Unit, content: @Composable (Panel) -> Unit) {
+fun PanelHost(
+    panel: Panel?,
+    onDismiss: () -> Unit,
+    onSize: (IntSize) -> Unit = {},
+    content: @Composable (Panel) -> Unit,
+) {
     // Keeps the content in place while the panel animates out.
     var last by remember { mutableStateOf(panel) }
     if (panel != null) last = panel
@@ -105,11 +112,14 @@ fun PanelHost(panel: Panel?, onDismiss: () -> Unit, content: @Composable (Panel)
                 } else {
                     RoundedCornerShape(topStart = 24.dp, topEnd = 24.dp)
                 },
-                modifier = if (landscape) {
-                    Modifier.fillMaxHeight().width((maxWidth * 0.46f).coerceIn(300.dp, 420.dp))
-                } else {
-                    Modifier.fillMaxWidth().heightIn(max = maxHeight * 0.62f)
-                },
+                modifier = (
+                    if (landscape) {
+                        Modifier.fillMaxHeight().width((maxWidth * 0.46f).coerceIn(300.dp, 420.dp))
+                    } else {
+                        Modifier.fillMaxWidth().heightIn(max = maxHeight * 0.62f)
+                    }
+                    // How much of the screen the panel covers, for what has to stay in view beside it.
+                    ).onSizeChanged(onSize),
             ) {
                 Box(
                     Modifier.windowInsetsPadding(

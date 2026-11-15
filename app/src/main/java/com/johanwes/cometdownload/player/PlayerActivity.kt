@@ -44,6 +44,7 @@ class PlayerActivity : ComponentActivity() {
 
         viewModel.open(
             paths = intent.getStringArrayListExtra(EXTRA_PATHS).orEmpty(),
+            labels = intent.getStringArrayListExtra(EXTRA_LABELS).orEmpty(),
             startIndex = intent.getIntExtra(EXTRA_INDEX, 0),
             title = intent.getStringExtra(EXTRA_TITLE).orEmpty(),
         )
@@ -95,15 +96,20 @@ class PlayerActivity : ComponentActivity() {
 
     companion object {
         private const val EXTRA_PATHS = "paths"
+        private const val EXTRA_LABELS = "labels"
         private const val EXTRA_INDEX = "index"
         private const val EXTRA_TITLE = "title"
         private const val LARGE_SCREEN_MIN_WIDTH_DP = 600
 
-        /** Plays [paths] (the episodes of one download) starting with the one at [index]. */
-        fun start(context: Context, paths: List<String>, index: Int, title: String) {
+        /**
+         * Plays [paths] (the episodes of one title) starting with the one at [index]. [labels]
+         * says what each one is ("S1 E2 · Cat's in the Bag..."), blank where that is unknown.
+         */
+        fun start(context: Context, paths: List<String>, labels: List<String>, index: Int, title: String) {
             context.startActivity(
                 Intent(context, PlayerActivity::class.java)
                     .putStringArrayListExtra(EXTRA_PATHS, ArrayList(paths))
+                    .putStringArrayListExtra(EXTRA_LABELS, ArrayList(labels))
                     .putExtra(EXTRA_INDEX, index)
                     .putExtra(EXTRA_TITLE, title),
             )

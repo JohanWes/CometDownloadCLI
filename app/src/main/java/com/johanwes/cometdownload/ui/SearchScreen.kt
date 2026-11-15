@@ -42,6 +42,7 @@ import androidx.compose.foundation.text.KeyboardOptions
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.filled.KeyboardArrowRight
 import androidx.compose.material.icons.filled.Close
+import androidx.compose.material.icons.filled.DownloadDone
 import androidx.compose.material.icons.filled.Search
 import androidx.compose.material.icons.filled.SearchOff
 import androidx.compose.material.icons.outlined.ErrorOutline
@@ -221,6 +222,7 @@ private fun ResultsPane(
                     items(results.value, key = { it.imdbId + it.isSeries }) { media ->
                         MediaRow(
                             media = media,
+                            inLibrary = media.imdbId in viewModel.libraryIds,
                             selected = !showChevrons && media == viewModel.selected,
                             showChevron = showChevrons,
                             onClick = { viewModel.select(media) },
@@ -293,7 +295,7 @@ private fun SearchField(
 }
 
 @Composable
-private fun MediaRow(media: MediaItem, selected: Boolean, showChevron: Boolean, onClick: () -> Unit) {
+private fun MediaRow(media: MediaItem, inLibrary: Boolean, selected: Boolean, showChevron: Boolean, onClick: () -> Unit) {
     Surface(
         onClick = onClick,
         shape = MaterialTheme.shapes.medium,
@@ -334,6 +336,14 @@ private fun MediaRow(media: MediaItem, selected: Boolean, showChevron: Boolean, 
                             )
                         }
                     }
+                }
+                if (inLibrary) {
+                    Tag(
+                        "In library",
+                        MaterialTheme.colorScheme.primaryContainer,
+                        MaterialTheme.colorScheme.onPrimaryContainer,
+                        Icons.Default.DownloadDone,
+                    )
                 }
             }
             if (showChevron) {

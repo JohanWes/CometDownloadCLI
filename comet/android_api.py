@@ -908,7 +908,12 @@ class AndroidCometApi:
     @_friendly
     def details(self, media_json: str, refresh: bool = False) -> str:
         media = _media_from_dict(json.loads(media_json))
-        return json.dumps(metadata.details(media.media_type, media.imdb_id, bool(refresh)))
+        details = metadata.details(media.media_type, media.imdb_id, bool(refresh))
+        for episode in details["episodes"]:
+            # Only the library shows these, and it reads them from its own stored copy.
+            episode.pop("overview", None)
+            episode.pop("thumbnail", None)
+        return json.dumps(details)
 
     @_friendly
     def streams(
@@ -1142,18 +1147,28 @@ class AndroidCometApi:
             self.meta.prune({job.imdb_id for job in self.manager.snapshot()})
 
     def library_details(self, fetch: bool = False) -> str:
-        """Details (plot, rating, artwork paths, episode titles) per IMDb id, for every title
-        with a download. Without [fetch] only what is stored on the device is returned, which
-        is instant and works offline; with it, missing and week-old entries are fetched first."""
+        """Details (plot, rating, artwork paths, episode titles, overviews and stills) per IMDb
+        id, for every title with a download. Without [fetch] only what is stored on the device
+        is returned, which is instant and works offline; with it, missing and week-old entries
+        are fetched first, and so are the stills of episodes that have none yet."""
         if self.meta is None:
             return "{}"
-        titles = {job.imdb_id: job.media_type for job in self.manager.snapshot() if job.imdb_id}
+        jobs = [job for job in self.manager.snapshot() if job.imdb_id]
+        titles = {job.imdb_id: job.media_type for job in jobs}
         if not fetch:
             stored = {imdb_id: self.meta.load(imdb_id) for imdb_id in titles}
         else:
+            # Stills are kept only for the episodes that are on the device.
+            on_device: dict[str, set[tuple[int, int]]] = {}
+            for job in jobs:
+                for video in _video_files(job):
+                    if video["season"] and video["episode"]:
+                        on_device.setdefault(job.imdb_id, set()).add((video["season"], video["episode"]))
             with ThreadPoolExecutor(max_workers=4) as pool:
                 futures = {
-                    imdb_id: pool.submit(self.meta.ensure, media_type, imdb_id)
+                    imdb_id: pool.submit(
+                        self.meta.ensure, media_type, imdb_id, episodes=on_device.get(imdb_id, ())
+                    )
                     for imdb_id, media_type in titles.items()
                 }
                 stored = {imdb_id: future.result() for imdb_id, future in futures.items()}

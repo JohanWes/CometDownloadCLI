@@ -42,17 +42,24 @@ import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
 import java.io.File
 
-/** One video of the playlist: a movie, or an episode of the season being played. */
-data class PlayerItem(val path: String) {
+/**
+ * One video of the playlist: a movie, or an episode of the show being played. [label] says
+ * which one ("S1 E2 · Cat's in the Bag..."); blank for a movie.
+ */
+data class PlayerItem(val path: String, val label: String) {
     val fileName: String = File(path).name
 
-    /** "S01E02" when the file name says which episode it is. */
-    val episodeTag: String? = EPISODE_TAG.find(fileName)?.let { match ->
-        "S%02dE%02d".format(match.groupValues[1].toInt(), match.groupValues[2].toInt())
-    }
+    companion object {
+        private val EPISODE_TAG = Regex("""[Ss](\d{1,2})[ ._-]?[Ee](\d{1,3})""")
 
-    private companion object {
-        val EPISODE_TAG = Regex("""[Ss](\d{1,2})[ ._-]?[Ee](\d{1,3})""")
+        /** Without a label from the library, the file name may still say which episode it is. */
+        fun of(path: String, label: String?): PlayerItem = PlayerItem(
+            path = path,
+            label = label?.ifBlank { null }
+                ?: EPISODE_TAG.find(File(path).name)
+                    ?.let { "S${it.groupValues[1].toInt()} E${it.groupValues[2].toInt()}" }
+                    .orEmpty(),
+        )
     }
 }
 
@@ -91,6 +98,9 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
     var isBuffering by mutableStateOf(true)
         private set
     var ended by mutableStateOf(false)
+        private set
+    /** Played through to the end of the last video: there is nothing left to show here. */
+    var finished by mutableStateOf(false)
         private set
     var error by mutableStateOf<String?>(null)
         private set
@@ -137,6 +147,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
 
     private var opened = false
     private var prepared = false
+    private var scrubbing = false
     /** The default subtitle and audio choice is made once per video, when its tracks are known. */
     private var defaultsApplied = false
     private var sidecarTrack: SubtitleTrack? = null
@@ -163,16 +174,17 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
     }
 
     /** Starts playing [paths] at [startIndex]; later calls (activity recreated) do nothing. */
-    fun open(paths: List<String>, startIndex: Int, title: String) {
+    fun open(paths: List<String>, labels: List<String>, startIndex: Int, title: String) {
         if (opened || paths.isEmpty()) return
         opened = true
         this.title = title
-        items = paths.map(::PlayerItem)
+        items = paths.mapIndexed { i, path -> PlayerItem.of(path, labels.getOrNull(i)) }
         index = startIndex.coerceIn(0, items.lastIndex)
         val mediaItems = items.map { MediaItem.Builder().setUri(Uri.fromFile(File(it.path))).setMediaId(it.path).build() }
         player.setMediaItems(mediaItems, index, store.get(items[index].path).positionMs)
         onItemChanged()
         player.play()
+        updatePlaying()
         // Loading starts when the picture has somewhere to go (onSurfaceSizeChanged): a decoder
         // started without a surface has to be re-pointed at it, which some devices get wrong
         // (black picture). The timeout only covers a surface that never shows up.
@@ -212,6 +224,7 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
 
     /** While the seek bar is dragged the player shows frames as fast as it can find them. */
     fun setScrubbing(active: Boolean) {
+        scrubbing = active
         player.isScrubbingModeEnabled = active
     }
 
@@ -403,15 +416,26 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
     override fun onPlaybackStateChanged(state: Int) {
         isBuffering = state == Player.STATE_BUFFERING
         ended = state == Player.STATE_ENDED
-        if (state == Player.STATE_ENDED) savePosition()
+        if (state == Player.STATE_ENDED) {
+            savePosition()
+            // Dragging the seek bar to its end is not the same as having watched to the end.
+            if (!scrubbing) finished = true
+        }
     }
 
     override fun onEvents(player: Player, events: Player.Events) {
         // The duration becomes known (or changes with the video) without an event of its own.
         durationMs = player.duration.takeIf { it != C.TIME_UNSET } ?: 0L
-        // "Playing" as the viewer means it: also while a seek or the start is still loading.
+        updatePlaying()
+    }
+
+    /** "Playing" as the viewer means it: also while a seek or the start is still loading. */
+    private fun updatePlaying() {
+        val state = player.playbackState
+        // Before loading has begun (the picture has nowhere to go yet) the player is idle.
+        val starting = state == Player.STATE_IDLE && !prepared && error == null
         isPlaying = player.playWhenReady &&
-            (player.playbackState == Player.STATE_READY || player.playbackState == Player.STATE_BUFFERING)
+            (state == Player.STATE_READY || state == Player.STATE_BUFFERING || starting)
     }
 
     override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {

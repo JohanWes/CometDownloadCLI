@@ -14,6 +14,10 @@ data class LibraryEpisode(
     /** The download this file came from. */
     val jobId: Int,
     val playback: Playback?,
+    /** What the episode is about, blank when it isn't known. */
+    val overview: String = "",
+    /** A still from the episode, saved on the device; blank when there is none. */
+    val still: String = "",
 ) {
     val watched: Boolean get() = playback?.watched == true
     val inProgress: Boolean get() = (playback?.positionMs ?: 0) > 0
@@ -26,6 +30,9 @@ data class LibraryEpisode(
 
     /** "S2 E5", or blank when the season or episode is unknown. */
     val tag: String get() = if (season > 0 && episode > 0) "S$season E$episode" else ""
+
+    /** "S2 E5 · Mysterious Ways": what the player shows under the title of the show. */
+    val label: String get() = listOf(tag, title).filter { it.isNotBlank() }.joinToString(" · ")
 
     /** Copies of the same episode count as one when it comes to what has been watched. */
     internal val identity: Any get() = if (season > 0 && episode > 0) season to episode else path
@@ -143,7 +150,7 @@ fun buildLibrary(
         .map { (key, group) ->
             val first = group.first()
             val stored = details[first.imdbId]
-            val titles = stored?.episodes.orEmpty().associate { (it.season to it.episode) to it.title }
+            val known = stored?.episodes.orEmpty().associateBy { it.season to it.episode }
             val isSeries = group.any { it.isSeries }
             LibraryTitle(
                 key = key,
@@ -156,14 +163,17 @@ fun buildLibrary(
                 episodes = group
                     .flatMap { job ->
                         job.files.map { file ->
+                            val episode = known[file.season to file.episode]
                             LibraryEpisode(
                                 season = file.season,
                                 episode = file.episode,
-                                title = titles[file.season to file.episode].orEmpty(),
+                                title = episode?.title.orEmpty(),
                                 path = file.path,
                                 bytes = file.bytes,
                                 jobId = job.id,
                                 playback = playback[file.path],
+                                overview = episode?.overview.orEmpty(),
+                                still = episode?.still.orEmpty(),
                             )
                         }
                     }

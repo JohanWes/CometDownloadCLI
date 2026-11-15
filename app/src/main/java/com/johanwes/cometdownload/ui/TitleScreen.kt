@@ -35,6 +35,7 @@ import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.windowInsetsBottomHeight
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyListScope
+import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
@@ -92,12 +93,43 @@ import com.johanwes.cometdownload.MediaDetails
 import com.johanwes.cometdownload.MediaItem
 import com.johanwes.cometdownload.JobItem
 import com.johanwes.cometdownload.JobState
+import com.johanwes.cometdownload.LibraryTitle
+import com.johanwes.cometdownload.episodesLabel
 import com.johanwes.cometdownload.StreamItem
 import com.johanwes.cometdownload.StreamState
 import com.johanwes.cometdownload.formatBytes
 import com.johanwes.cometdownload.formatRuntime
 
 internal val TopBarHeight = 64.dp
+
+/** How far the poster reaches up into the backdrop. */
+private val PosterRise = 104.dp
+
+/** What a title page's top bar shows at the current scroll position. */
+internal data class TopBarState(
+    /** Filled with the page colour instead of floating on the artwork. */
+    val solid: Boolean,
+    /** Showing the title, the header's own having scrolled away. */
+    val titled: Boolean,
+)
+
+/**
+ * The bar turns solid once the poster reaches it (it would otherwise slide under the buttons
+ * and the status bar), and shows the title once the backdrop has scrolled away beneath it.
+ */
+@Composable
+internal fun rememberTopBarState(listState: LazyListState, backdropHeight: Dp, statusTop: Dp): TopBarState {
+    val titledAt = with(LocalDensity.current) { (backdropHeight - TopBarHeight - statusTop).toPx() }
+    val solidAt = titledAt - with(LocalDensity.current) { PosterRise.toPx() }
+    val state by remember(listState, titledAt, solidAt) {
+        derivedStateOf {
+            val past = listState.firstVisibleItemIndex > 0
+            val offset = listState.firstVisibleItemScrollOffset
+            TopBarState(solid = past || offset > solidAt, titled = past || offset > titledAt)
+        }
+    }
+    return state
+}
 
 /**
  * One scrolling page per title: backdrop header with poster, rating and plot, then the
@@ -111,12 +143,8 @@ fun TitleScreen(viewModel: CometViewModel, media: MediaItem, embedded: Boolean, 
     val details = (viewModel.details as? Load.Ready)?.value
     val statusTop = if (embedded) 0.dp else WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val backdropHeight = (if (embedded) 200.dp else 230.dp) + statusTop
-    val density = LocalDensity.current
-    // The bar turns solid (and shows the title) once the backdrop has scrolled away beneath it.
-    val collapseAt = with(density) { (backdropHeight - TopBarHeight - statusTop).toPx() }
-    val collapsed by remember(collapseAt) {
-        derivedStateOf { listState.firstVisibleItemIndex > 0 || listState.firstVisibleItemScrollOffset > collapseAt }
-    }
+    val bar = rememberTopBarState(listState, backdropHeight, statusTop)
+    val inLibrary = viewModel.libraryTitle(media)
 
     Box(Modifier.fillMaxSize()) {
         LazyColumn(
@@ -127,6 +155,15 @@ fun TitleScreen(viewModel: CometViewModel, media: MediaItem, embedded: Boolean, 
         ) {
             item(key = "header") {
                 TitleHeader(media = media, details = details, backdropHeight = backdropHeight, paneColor = paneColor)
+            }
+            if (inLibrary != null) {
+                item(key = "in-library") {
+                    InLibraryRow(
+                        title = inLibrary,
+                        onOpen = { viewModel.showInLibrary(inLibrary) },
+                        modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = 8.dp),
+                    )
+                }
             }
             if (media.isSeries) {
                 item(key = "episodes") {
@@ -144,7 +181,7 @@ fun TitleScreen(viewModel: CometViewModel, media: MediaItem, embedded: Boolean, 
 
         TitleTopBar(
             title = media.title,
-            collapsed = collapsed,
+            bar = bar,
             embedded = embedded,
             paneColor = paneColor,
             onBack = if (embedded) null else ({ viewModel.select(null) }),
@@ -203,7 +240,7 @@ internal fun TitleHeader(
                 }
             }
             Row(
-                modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = backdropHeight - 104.dp),
+                modifier = Modifier.padding(start = 16.dp, end = 16.dp, top = backdropHeight - PosterRise),
                 verticalAlignment = Alignment.Bottom,
                 horizontalArrangement = Arrangement.spacedBy(16.dp),
             ) {
@@ -296,14 +333,14 @@ private fun Plot(text: String, modifier: Modifier = Modifier) {
 @Composable
 internal fun TitleTopBar(
     title: String,
-    collapsed: Boolean,
+    bar: TopBarState,
     embedded: Boolean,
     paneColor: Color,
     onBack: (() -> Unit)?,
     actions: @Composable (scrim: Boolean) -> Unit,
 ) {
-    val barColor by animateColorAsState(if (collapsed) paneColor else paneColor.copy(alpha = 0f), label = "bar")
-    val titleAlpha by animateFloatAsState(if (collapsed) 1f else 0f, label = "title")
+    val barColor by animateColorAsState(if (bar.solid) paneColor else paneColor.copy(alpha = 0f), label = "bar")
+    val titleAlpha by animateFloatAsState(if (bar.titled) 1f else 0f, label = "title")
     Surface(color = barColor, modifier = Modifier.fillMaxWidth()) {
         Row(
             modifier = Modifier
@@ -313,7 +350,7 @@ internal fun TitleTopBar(
             verticalAlignment = Alignment.CenterVertically,
         ) {
             if (onBack != null) {
-                ScrimIconButton(Icons.AutoMirrored.Filled.ArrowBack, "Back", scrim = !collapsed, onClick = onBack)
+                ScrimIconButton(Icons.AutoMirrored.Filled.ArrowBack, "Back", scrim = !bar.solid, onClick = onBack)
             }
             Text(
                 title,
@@ -325,7 +362,7 @@ internal fun TitleTopBar(
                     .padding(horizontal = 8.dp)
                     .graphicsLayer { alpha = titleAlpha },
             )
-            actions(!collapsed)
+            actions(!bar.solid)
         }
     }
 }
@@ -353,6 +390,32 @@ internal fun ScrimIconButton(
         ),
     ) {
         Icon(icon, contentDescription = description)
+    }
+}
+
+/** Says that (some of) this title is already downloaded, and leads to it in the library. */
+@Composable
+private fun InLibraryRow(title: LibraryTitle, onOpen: () -> Unit, modifier: Modifier = Modifier) {
+    val colors = MaterialTheme.colorScheme
+    Surface(
+        onClick = onOpen,
+        color = colors.surfaceContainer,
+        shape = MaterialTheme.shapes.medium,
+        modifier = modifier.fillMaxWidth(),
+    ) {
+        Row(
+            Modifier.padding(start = 16.dp, end = 4.dp, top = 4.dp, bottom = 4.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp),
+        ) {
+            Icon(Icons.Default.DownloadDone, contentDescription = null, tint = colors.primary, modifier = Modifier.size(20.dp))
+            Text(
+                if (title.isSeries) "${episodesLabel(title.episodeCount)} in your library" else "In your library",
+                style = MaterialTheme.typography.bodyMedium,
+                modifier = Modifier.weight(1f),
+            )
+            TextButton(onClick = onOpen) { Text("Open") }
+        }
     }
 }
 
@@ -620,6 +683,7 @@ private fun LazyListScope.streamItems(
     onExpand: (String) -> Unit,
 ) {
     // For a season pack, an approximate per-episode size helps compare against single episodes.
+    val room = viewModel.downloadRoom
     val packEpisodes = if (media.isSeries && viewModel.scope.episode == 0) {
         (viewModel.details as? Load.Ready)?.value?.episodesIn(viewModel.scope.season)?.count { it.aired } ?: 0
     } else {
@@ -698,6 +762,7 @@ private fun LazyListScope.streamItems(
                     StreamRow(
                         stream = stream,
                         state = viewModel.streamState(stream),
+                        fits = room == null || stream.sizeBytes <= room,
                         packEpisodes = packEpisodes,
                         providerLabel = viewModel.settings.provider.label,
                         onQueue = { viewModel.enqueue(stream) },
@@ -723,6 +788,7 @@ private fun LazyListScope.streamItems(
 private fun StreamRow(
     stream: StreamItem,
     state: StreamState,
+    fits: Boolean,
     packEpisodes: Int,
     providerLabel: String,
     onQueue: () -> Unit,
@@ -732,10 +798,13 @@ private fun StreamRow(
     val colors = MaterialTheme.colorScheme
     val job = (state as? StreamState.Linked)?.job
     val tags = remember(stream.description) { releaseTags(stream.description) }
+    // Said before the tap rather than after it; a download that is already running has its space.
+    val tooBig = !fits && state == StreamState.Ready
     // Uncached streams are a gamble (the debrid service has to fetch them first), so they
-    // sit visually behind the cached ones.
-    val container = if (stream.cached) colors.surfaceContainer else colors.surfaceContainerLow
-    val sizeColor = if (stream.cached) colors.onSurface else colors.onSurfaceVariant
+    // sit visually behind the cached ones. So does what there is no room for.
+    val prominent = stream.cached && !tooBig
+    val container = if (prominent) colors.surfaceContainer else colors.surfaceContainerLow
+    val sizeColor = if (prominent) colors.onSurface else colors.onSurfaceVariant
     Surface(color = container, shape = MaterialTheme.shapes.medium, modifier = modifier.fillMaxWidth()) {
         Column {
             Row(
@@ -787,9 +856,12 @@ private fun StreamRow(
                         )
                     }
                     if (job != null) JobStatusText(job)
+                    if (tooBig) {
+                        Text("Not enough free space", style = MaterialTheme.typography.labelMedium, color = colors.error)
+                    }
                 }
                 Box(Modifier.size(48.dp), contentAlignment = Alignment.Center) {
-                    StreamAction(stream, state, providerLabel, onQueue, onShowDownloads)
+                    StreamAction(stream, state, tooBig, providerLabel, onQueue, onShowDownloads)
                 }
             }
             val progress = job?.progress
@@ -830,13 +902,23 @@ private fun JobStatusText(job: JobItem) {
 private fun StreamAction(
     stream: StreamItem,
     state: StreamState,
+    tooBig: Boolean,
     providerLabel: String,
     onQueue: () -> Unit,
     onShowDownloads: () -> Unit,
 ) {
     val colors = MaterialTheme.colorScheme
     when (state) {
-        StreamState.Ready -> if (stream.cached) {
+        // Still a button: tapping it says how much is needed and how much is free.
+        StreamState.Ready -> if (tooBig) {
+            IconButton(onClick = onQueue) {
+                Icon(
+                    Icons.Default.Download,
+                    contentDescription = "Download (not enough free space)",
+                    tint = colors.onSurfaceVariant.copy(alpha = 0.5f),
+                )
+            }
+        } else if (stream.cached) {
             FilledTonalIconButton(onClick = onQueue) {
                 Icon(Icons.Default.Download, contentDescription = "Download")
             }

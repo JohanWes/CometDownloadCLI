@@ -111,8 +111,9 @@ fun CometApp(viewModel: CometViewModel, onExit: () -> Unit) {
         BackHandler {
             when {
                 viewModel.tab == Tab.Library && viewModel.openTitle != null -> viewModel.openTitle(null)
-                viewModel.tab == Tab.Library || viewModel.tab == Tab.Update -> viewModel.tab = Tab.Search
-                !twoPane && viewModel.selected != null -> viewModel.select(null)
+                viewModel.tab == Tab.Search && !twoPane && viewModel.selected != null -> viewModel.select(null)
+                // Back leaves the other tabs for the one the app opens on, and the app from there.
+                viewModel.tab != viewModel.homeTab -> viewModel.tab = viewModel.homeTab
                 else -> onExit()
             }
         }

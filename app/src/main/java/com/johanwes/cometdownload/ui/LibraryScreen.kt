@@ -48,7 +48,6 @@ import androidx.compose.material.icons.outlined.FolderOff
 import androidx.compose.material.icons.outlined.SubtitlesOff
 import androidx.compose.material.icons.outlined.Subtitles
 import androidx.compose.material.icons.outlined.VideoLibrary
-import androidx.compose.material.icons.rounded.Star
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
@@ -98,9 +97,11 @@ import com.johanwes.cometdownload.formatBytes
 import com.johanwes.cometdownload.formatEta
 import com.johanwes.cometdownload.formatSpeed
 import com.johanwes.cometdownload.player.PlayerActivity
+import kotlinx.coroutines.delay
 import java.io.File
 
 private val GridPadding = 16.dp
+private const val LOADING_SPINNER_DELAY_MS = 700L
 
 /** Keys of the section headings; whichever comes first is the top of the grid. */
 private val SectionKeys = setOf("downloads-label", "continue-label", "titles-label")
@@ -210,6 +211,20 @@ private fun LibraryFront(viewModel: CometViewModel, showSettingsAction: Boolean,
         }
 
         if (library.isEmpty() && downloads.isEmpty()) {
+            if (!viewModel.jobsLoaded) {
+                // The app can open on this tab before the download list has been read. Until
+                // then it is not "nothing in your library": show nothing, and a spinner only
+                // when it takes long.
+                var slow by remember { mutableStateOf(false) }
+                LaunchedEffect(Unit) {
+                    delay(LOADING_SPINNER_DELAY_MS)
+                    slow = true
+                }
+                if (slow) {
+                    Box(Modifier.fillMaxSize(), contentAlignment = Alignment.Center) { CircularProgressIndicator() }
+                }
+                return@Column
+            }
             MessageState(
                 icon = Icons.Outlined.VideoLibrary,
                 title = "Nothing in your library yet",
@@ -335,8 +350,14 @@ internal fun playFromLibrary(
         viewModel.showMessage("That file is gone. It may have been moved or deleted.")
         return
     }
-    val paths = if (title.isSeries) title.episodes.map { it.path } else listOf(episode.path)
-    PlayerActivity.start(context, paths, paths.indexOf(episode.path), title.name)
+    val playlist = if (title.isSeries) title.episodes else listOf(episode)
+    PlayerActivity.start(
+        context = context,
+        paths = playlist.map { it.path },
+        labels = playlist.map { it.label },
+        index = playlist.indexOfFirst { it.path == episode.path },
+        title = title.name,
+    )
 }
 
 /** Something that is only done after the user confirmed it. */
@@ -409,7 +430,7 @@ private fun SortMenu(current: LibrarySort, onPick: (LibrarySort) -> Unit) {
     }
 }
 
-/** A title in the grid: its poster with rating and progress, and where you are below it. */
+/** A title in the grid: its poster with progress on it, and where you are below it. */
 @OptIn(ExperimentalFoundationApi::class)
 @Composable
 private fun PosterCard(
@@ -435,13 +456,8 @@ private fun PosterCard(
     ) {
         // Clipped as a whole, so the progress bar follows the poster's rounded corners.
         Box(Modifier.clip(MaterialTheme.shapes.small)) {
+            // No rating here: it helped pick the title in search; on your own shelf it is in the way.
             Poster(url = title.poster, isSeries = title.isSeries, modifier = Modifier.fillMaxWidth(), iconSize = 32.dp)
-            if (title.rating.isNotBlank()) {
-                PosterBadge(Modifier.align(Alignment.TopStart).padding(6.dp)) {
-                    Icon(Icons.Rounded.Star, contentDescription = "IMDb rating", tint = RatingStar, modifier = Modifier.size(12.dp))
-                    Text(title.rating, style = MaterialTheme.typography.labelSmall, fontWeight = FontWeight.SemiBold)
-                }
-            }
             if (title.allWatched) {
                 Surface(
                     shape = CircleShape,

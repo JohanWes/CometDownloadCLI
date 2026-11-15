@@ -61,6 +61,10 @@ data class Episode(
     val title: String,
     val released: String,
     val aired: Boolean,
+    /** What the episode is about; only the library's stored details carry it. */
+    val overview: String = "",
+    /** Path of a still from the episode saved on the device, for episodes that are downloaded. */
+    val still: String = "",
 )
 
 data class MediaDetails(
@@ -191,6 +195,8 @@ private fun detailsFrom(obj: JSONObject): MediaDetails {
                 title = episode.optStringOrBlank("title"),
                 released = episode.optStringOrBlank("released"),
                 aired = episode.optBoolean("aired", true),
+                overview = episode.optStringOrBlank("overview"),
+                still = episode.optStringOrBlank("still"),
             )
         },
     )

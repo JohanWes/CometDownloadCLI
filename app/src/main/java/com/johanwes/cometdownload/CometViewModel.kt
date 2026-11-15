@@ -73,7 +73,13 @@ class CometViewModel(application: Application) : AndroidViewModel(application) {
         private set
 
     // Navigation
-    var tab by mutableStateOf(Tab.Search)
+    /**
+     * Where the app opens and where Back ends up: the library once something is in it (what
+     * was being watched is one tap away, also without a network), search until then.
+     */
+    val homeTab: Tab =
+        if (settings.isConfigured && uiPrefs.getBoolean(KEY_HAS_LIBRARY, false)) Tab.Library else Tab.Search
+    var tab by mutableStateOf(homeTab)
 
     // Search
     var query by mutableStateOf("")
@@ -106,6 +112,9 @@ class CometViewModel(application: Application) : AndroidViewModel(application) {
     // Downloads
     var jobs by mutableStateOf(emptyList<JobItem>())
         private set
+    /** False until the download list was read once: an empty library may just not be there yet. */
+    var jobsLoaded by mutableStateOf(false)
+        private set
     var freeBytes by mutableStateOf(-1L)
         private set
     var storageGranted by mutableStateOf(hasStorageAccess(application))
@@ -121,6 +130,10 @@ class CometViewModel(application: Application) : AndroidViewModel(application) {
     private var detailIds = emptySet<String>()
     private var libraryDetailsJob: Job? = null
     val library: List<LibraryTitle> by derivedStateOf { buildLibrary(jobs, playback, libraryDetails) }
+    /** IMDb ids of the titles in the library, to mark them where they turn up in search. */
+    val libraryIds: Set<String> by derivedStateOf {
+        library.map { it.media.imdbId }.filter { it.isNotBlank() }.toSet()
+    }
     private var openTitleKey by mutableStateOf<String?>(null)
     /** The title whose page is open in the Library tab. */
     val openTitle: LibraryTitle? get() = openTitleKey?.let { key -> library.firstOrNull { it.key == key } }
@@ -341,11 +354,7 @@ class CometViewModel(application: Application) : AndroidViewModel(application) {
         }
         refreshFreeSpace()
         val free = freeBytes
-        // Downloads that are queued or running haven't used their space yet.
-        val reserved = jobs.filter { it.isActive }.sumOf { job ->
-            val size = jobSizes[job.id] ?: 0L
-            (size * (1f - (job.overallProgress ?: 0f))).toLong()
-        }
+        val reserved = reservedBytes()
         if (sizeBytes > 0 && free >= 0 && sizeBytes + reserved + FREE_SPACE_MARGIN > free) {
             val running = if (reserved > 0) " (${formatBytes(reserved)} of it is for downloads in progress)" else ""
             messageChannel.trySend(
@@ -355,6 +364,19 @@ class CometViewModel(application: Application) : AndroidViewModel(application) {
         }
         return true
     }
+
+    /** Downloads that are queued or running haven't used their space yet. */
+    private fun reservedBytes(): Long = jobs.filter { it.isActive }.sumOf { job ->
+        val size = jobSizes[job.id] ?: 0L
+        (size * (1f - (job.overallProgress ?: 0f))).toLong()
+    }
+
+    /**
+     * How large a new download may be (what is free, less what running downloads still need),
+     * or null when the free space is unknown. Stream rows use it to say up front what won't fit.
+     */
+    val downloadRoom: Long?
+        get() = freeBytes.takeIf { it >= 0 }?.let { it - reservedBytes() - FREE_SPACE_MARGIN }
 
     /** The most relevant job for one episode of the open series (active first, then done). */
     fun episodeJob(season: Int, episode: Int): JobItem? {
@@ -414,6 +436,16 @@ class CometViewModel(application: Application) : AndroidViewModel(application) {
 
     fun openTitle(title: LibraryTitle?) {
         openTitleKey = title?.key
+    }
+
+    /** The library's entry for a title found in search, when some of it has been downloaded. */
+    fun libraryTitle(media: MediaItem): LibraryTitle? =
+        if (media.imdbId.isBlank()) null else library.firstOrNull { it.media.imdbId == media.imdbId }
+
+    /** Opens a title's page in the Library tab. */
+    fun showInLibrary(title: LibraryTitle) {
+        openTitleKey = title.key
+        tab = Tab.Library
     }
 
     /** A tap on a tab; on the tab that is already showing it goes back to its front page. */
@@ -532,6 +564,12 @@ class CometViewModel(application: Application) : AndroidViewModel(application) {
         call { backend.jobs() }.onSuccess { fresh ->
             val finishedBefore = jobs.count { it.state == JobState.Completed }
             jobs = fresh
+            jobsLoaded = true
+            // Remembered for the next start, which has to pick its first screen before this is known.
+            val hasLibrary = fresh.any { it.state == JobState.Completed && it.files.isNotEmpty() }
+            if (hasLibrary != uiPrefs.getBoolean(KEY_HAS_LIBRARY, false)) {
+                uiPrefs.edit().putBoolean(KEY_HAS_LIBRARY, hasLibrary).apply()
+            }
             if (fresh.count { it.state == JobState.Completed } != finishedBefore) refreshPlayback()
             val ids = fresh.map { it.imdbId }.filter { it.isNotBlank() }.toSet()
             if (ids != detailIds) {
@@ -585,6 +623,7 @@ class CometViewModel(application: Application) : AndroidViewModel(application) {
     private companion object {
         const val KEY_RECENT = "recent_searches"
         const val KEY_LIBRARY_SORT = "library_sort"
+        const val KEY_HAS_LIBRARY = "has_library"
         const val RECENT_LIMIT = 8
         const val FREE_SPACE_MARGIN = 512L * 1024 * 1024
     }

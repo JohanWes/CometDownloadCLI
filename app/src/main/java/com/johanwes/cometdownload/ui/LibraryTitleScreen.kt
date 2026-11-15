@@ -1,5 +1,6 @@
 package com.johanwes.cometdownload.ui
 
+import androidx.compose.foundation.background
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -8,6 +9,7 @@ import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.WindowInsets
 import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.aspectRatio
 import androidx.compose.foundation.layout.fillMaxSize
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.height
@@ -23,6 +25,7 @@ import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Add
 import androidx.compose.material.icons.filled.Check
@@ -44,7 +47,6 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.derivedStateOf
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableIntStateOf
 import androidx.compose.runtime.mutableStateOf
@@ -53,10 +55,10 @@ import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.StrokeCap
 import androidx.compose.ui.platform.LocalContext
-import androidx.compose.ui.platform.LocalDensity
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
@@ -83,12 +85,10 @@ fun LibraryTitleScreen(viewModel: CometViewModel, title: LibraryTitle, paneColor
     val listState = rememberLazyListState()
     val statusTop = WindowInsets.statusBars.asPaddingValues().calculateTopPadding()
     val backdropHeight = 230.dp + statusTop
-    val collapseAt = with(LocalDensity.current) { (backdropHeight - TopBarHeight - statusTop).toPx() }
-    // The bar turns solid (and shows the title) once the backdrop has scrolled away beneath it.
-    val collapsed by remember(collapseAt) {
-        derivedStateOf { listState.firstVisibleItemIndex > 0 || listState.firstVisibleItemScrollOffset > collapseAt }
-    }
+    val bar = rememberTopBarState(listState, backdropHeight, statusTop)
     val seasons = title.seasons
+    // Episodes are listed with a still and a line about them once those have been fetched.
+    val illustrated = title.isSeries && title.episodes.any { it.still.isNotBlank() }
     // Opens on the season being watched; a season that was deleted falls back to the first.
     var pickedSeason by rememberSaveable { mutableIntStateOf(title.nextUp?.season ?: seasons.firstOrNull() ?: 0) }
     val season = if (pickedSeason in seasons) pickedSeason else seasons.firstOrNull() ?: 0
@@ -146,6 +146,7 @@ fun LibraryTitleScreen(viewModel: CometViewModel, title: LibraryTitle, paneColor
                         number = episode.episode.takeIf { it > 0 },
                         name = name,
                         highlighted = episode.path == next?.path,
+                        illustrated = illustrated,
                         deleteLabel = "Delete episode",
                         onPlay = { playFromLibrary(context, viewModel, title, episode) },
                         onSetWatched = { watched -> viewModel.setWatched(listOf(episode), watched) },
@@ -187,6 +188,7 @@ fun LibraryTitleScreen(viewModel: CometViewModel, title: LibraryTitle, paneColor
                         number = null,
                         name = (listOfNotNull(resolutionTag(file)) + releaseTags(file).take(3)).joinToString(" · ").ifBlank { file },
                         highlighted = version.path == next?.path,
+                        illustrated = false,
                         deleteLabel = "Delete this version",
                         onPlay = { playFromLibrary(context, viewModel, title, version) },
                         onSetWatched = { watched -> viewModel.setWatched(listOf(version), watched) },
@@ -235,7 +237,7 @@ fun LibraryTitleScreen(viewModel: CometViewModel, title: LibraryTitle, paneColor
 
         TitleTopBar(
             title = title.name,
-            collapsed = collapsed,
+            bar = bar,
             embedded = false,
             paneColor = paneColor,
             onBack = { viewModel.openTitle(null) },
@@ -395,13 +397,17 @@ private fun SeasonBar(
     }
 }
 
-/** One downloaded video: an episode of a show, or one version of a movie. A tap plays it. */
+/**
+ * One downloaded video: an episode of a show, or one version of a movie. A tap plays it.
+ * [illustrated] rows lead with a still from the episode and end with what it is about.
+ */
 @Composable
 private fun VideoRow(
     video: LibraryEpisode,
     number: Int?,
     name: String,
     highlighted: Boolean,
+    illustrated: Boolean,
     deleteLabel: String,
     onPlay: () -> Unit,
     onSetWatched: (Boolean) -> Unit,
@@ -418,77 +424,135 @@ private fun VideoRow(
         shape = MaterialTheme.shapes.medium,
         modifier = modifier.fillMaxWidth(),
     ) {
-        Row(
-            Modifier.padding(start = 12.dp, top = 6.dp, bottom = 6.dp),
-            verticalAlignment = Alignment.CenterVertically,
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-        ) {
-            Box(Modifier.width(32.dp), contentAlignment = Alignment.Center) {
-                when {
-                    video.watched -> Icon(Icons.Default.Check, contentDescription = "Watched", tint = colors.primary)
-                    number != null -> Text("$number", style = MaterialTheme.typography.titleMedium, color = colors.onSurfaceVariant)
-                    else -> Icon(Icons.Default.PlayArrow, contentDescription = null, tint = colors.onSurfaceVariant)
+        val edge = if (illustrated) 8.dp else 6.dp
+        Column(Modifier.padding(start = 12.dp, top = edge, bottom = edge)) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(12.dp),
+            ) {
+                if (illustrated) {
+                    EpisodeStill(video = video, number = number, upNext = highlighted, modifier = Modifier.width(StillWidth))
+                } else {
+                    Box(Modifier.width(32.dp), contentAlignment = Alignment.Center) {
+                        when {
+                            video.watched -> Icon(Icons.Default.Check, contentDescription = "Watched", tint = colors.primary)
+                            number != null -> Text("$number", style = MaterialTheme.typography.titleMedium, color = colors.onSurfaceVariant)
+                            else -> Icon(Icons.Default.PlayArrow, contentDescription = null, tint = colors.onSurfaceVariant)
+                        }
+                    }
+                }
+                Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+                    Text(
+                        // The number leads the name where no column of its own shows it: beside a
+                        // still, and on a watched episode (whose number the check mark replaced).
+                        if ((illustrated || video.watched) && number != null) "$number. $name" else name,
+                        style = MaterialTheme.typography.bodyLarge,
+                        color = if (video.watched) colors.onSurfaceVariant else colors.onSurface,
+                        fontWeight = if (highlighted) FontWeight.Medium else FontWeight.Normal,
+                        maxLines = 2,
+                        overflow = TextOverflow.Ellipsis,
+                    )
+                    Text(
+                        listOfNotNull(
+                            video.remainingMs?.let(::formatTimeLeft),
+                            resolutionTag(file).takeIf { number != null },
+                            formatBytes(video.bytes),
+                        ).joinToString(" · "),
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (video.inProgress) colors.primary else colors.onSurfaceVariant,
+                    )
+                    // On an illustrated row the still carries the progress.
+                    video.progress?.takeUnless { illustrated }?.let { progress ->
+                        LinearProgressIndicator(
+                            progress = { progress },
+                            strokeCap = StrokeCap.Round,
+                            gapSize = 0.dp,
+                            drawStopIndicator = {},
+                            modifier = Modifier.padding(top = 4.dp).fillMaxWidth().height(3.dp),
+                        )
+                    }
+                }
+                var open by remember { mutableStateOf(false) }
+                Box {
+                    IconButton(onClick = { open = true }) {
+                        Icon(Icons.Default.MoreVert, contentDescription = "Options for $name", tint = colors.onSurfaceVariant)
+                    }
+                    DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
+                        DropdownMenuItem(
+                            text = { Text(if (video.watched) "Mark as unwatched" else "Mark as watched") },
+                            onClick = {
+                                open = false
+                                onSetWatched(!video.watched)
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text("Open with another app") },
+                            onClick = {
+                                open = false
+                                onOpenElsewhere()
+                            },
+                        )
+                        DropdownMenuItem(
+                            text = { Text(deleteLabel) },
+                            onClick = {
+                                open = false
+                                onDelete()
+                            },
+                        )
+                    }
                 }
             }
-            Column(Modifier.weight(1f), verticalArrangement = Arrangement.spacedBy(2.dp)) {
+            if (illustrated && video.overview.isNotBlank()) {
                 Text(
-                    // A watched episode keeps its number, which the check mark replaced.
-                    if (video.watched && number != null) "$number. $name" else name,
-                    style = MaterialTheme.typography.bodyLarge,
-                    color = if (video.watched) colors.onSurfaceVariant else colors.onSurface,
-                    fontWeight = if (highlighted) FontWeight.Medium else FontWeight.Normal,
-                    maxLines = 2,
-                    overflow = TextOverflow.Ellipsis,
-                )
-                Text(
-                    listOfNotNull(
-                        video.remainingMs?.let(::formatTimeLeft),
-                        resolutionTag(file).takeIf { number != null },
-                        formatBytes(video.bytes),
-                    ).joinToString(" · "),
+                    video.overview,
                     style = MaterialTheme.typography.bodySmall,
-                    color = if (video.inProgress) colors.primary else colors.onSurfaceVariant,
+                    color = colors.onSurfaceVariant,
+                    maxLines = 3,
+                    overflow = TextOverflow.Ellipsis,
+                    modifier = Modifier.padding(top = 8.dp, end = 12.dp),
                 )
-                video.progress?.let { progress ->
-                    LinearProgressIndicator(
-                        progress = { progress },
-                        strokeCap = StrokeCap.Round,
-                        gapSize = 0.dp,
-                        drawStopIndicator = {},
-                        modifier = Modifier.padding(top = 4.dp).fillMaxWidth().height(3.dp),
-                    )
-                }
-            }
-            var open by remember { mutableStateOf(false) }
-            Box {
-                IconButton(onClick = { open = true }) {
-                    Icon(Icons.Default.MoreVert, contentDescription = "Options for $name", tint = colors.onSurfaceVariant)
-                }
-                DropdownMenu(expanded = open, onDismissRequest = { open = false }) {
-                    DropdownMenuItem(
-                        text = { Text(if (video.watched) "Mark as unwatched" else "Mark as watched") },
-                        onClick = {
-                            open = false
-                            onSetWatched(!video.watched)
-                        },
-                    )
-                    DropdownMenuItem(
-                        text = { Text("Open with another app") },
-                        onClick = {
-                            open = false
-                            onOpenElsewhere()
-                        },
-                    )
-                    DropdownMenuItem(
-                        text = { Text(deleteLabel) },
-                        onClick = {
-                            open = false
-                            onDelete()
-                        },
-                    )
-                }
             }
         }
+    }
+}
+
+private val StillWidth = 124.dp
+
+/**
+ * A still from the episode with, on top of it, how far it was watched. Without a still (none
+ * exists, or it was not fetched yet) the episode's number stands in.
+ */
+@Composable
+private fun EpisodeStill(video: LibraryEpisode, number: Int?, upNext: Boolean, modifier: Modifier = Modifier) {
+    val colors = MaterialTheme.colorScheme
+    Box(
+        modifier
+            .aspectRatio(16f / 9f)
+            .clip(MaterialTheme.shapes.small)
+            .background(colors.surfaceContainerHighest),
+        contentAlignment = Alignment.Center,
+    ) {
+        if (video.still.isNotBlank()) {
+            RemoteImage(url = video.still, modifier = Modifier.fillMaxSize())
+        } else if (number != null) {
+            Text("$number", style = MaterialTheme.typography.titleLarge, color = colors.onSurfaceVariant.copy(alpha = 0.6f))
+        }
+        if (upNext) {
+            Surface(shape = CircleShape, color = Color.Black.copy(alpha = 0.55f), contentColor = Color.White) {
+                Icon(Icons.Default.PlayArrow, contentDescription = null, modifier = Modifier.padding(5.dp).size(20.dp))
+            }
+        }
+        if (video.watched) {
+            Surface(
+                shape = CircleShape,
+                color = colors.primary,
+                contentColor = colors.onPrimary,
+                modifier = Modifier.align(Alignment.TopEnd).padding(5.dp),
+            ) {
+                Icon(Icons.Default.Check, contentDescription = "Watched", modifier = Modifier.padding(2.dp).size(13.dp))
+            }
+        }
+        video.progress?.let { WatchBar(it, Modifier.align(Alignment.BottomCenter)) }
     }
 }
 

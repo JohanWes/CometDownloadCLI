@@ -15,7 +15,7 @@ import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterable
 from urllib.parse import quote
 from urllib.request import Request, urlopen
 
@@ -25,6 +25,7 @@ USER_AGENT = "CometDownload/1.0"
 REQUEST_TIMEOUT = 10
 MAX_MOVIES = 10
 MAX_SERIES = 8
+_OVERVIEW_LIMIT = 400
 YEAR_PATTERN = re.compile(r"\d{4}")
 RUNTIME_PATTERN = re.compile(r"(\d+)\s*min")
 
@@ -174,6 +175,12 @@ def _released(value: Any) -> str:
     return text[:10] if len(text) >= 10 else ""
 
 
+def _overview(value: Any) -> str:
+    """One paragraph about an episode, cut short when it runs long."""
+    text = " ".join(str(value or "").split())
+    return text if len(text) <= _OVERVIEW_LIMIT else text[: _OVERVIEW_LIMIT - 1].rstrip() + "…"
+
+
 def details(media_type: str, imdb_id: str, refresh: bool = False) -> dict[str, Any]:
     """Header data for the title view plus, for series, the episode list."""
     meta = fetch_meta(media_type, imdb_id, refresh=refresh)
@@ -199,6 +206,9 @@ def details(media_type: str, imdb_id: str, refresh: bool = False) -> dict[str, A
                 "title": str(video.get("name") or video.get("title") or ""),
                 "released": released,
                 "aired": not released or released <= today,
+                # For the library's episode list: what the episode is about and a still from it.
+                "overview": _overview(video.get("overview") or video.get("description")),
+                "thumbnail": str(video.get("thumbnail") or ""),
             }
         )
     episodes.sort(key=lambda item: (item["season"], item["episode"]))
@@ -223,11 +233,14 @@ _STORE_TTL_SECONDS = 7 * 24 * 3600
 _ARTWORK_RETRY_SECONDS = 6 * 3600
 _ARTWORK_TIMEOUT = 20
 _ARTWORK_MAX_BYTES = 8 * 1024 * 1024
+_STILL_TIMEOUT = 10
+_STILL_WORKERS = 4
 _IMDB_ID_PATTERN = re.compile(r"^tt\d+$")
 
 
 class MetaStore:
-    """One folder per title: `meta.json` (what `details` returned) plus its poster and backdrop.
+    """One folder per title: `meta.json` (what `details` returned) plus its poster and backdrop,
+    and a still for each episode that is on the device.
 
     The library reads from here, so box art, rating, plot and episode titles are there on a
     plane too. Everything in it can be fetched again; a missing or broken entry is not an error.
@@ -261,18 +274,34 @@ class MetaStore:
             value = str(stored.get(key) or "")
             if value.startswith("/") and not os.path.isfile(value):
                 stored[key] = ""
+        for episode in stored.get("episodes") or []:
+            if isinstance(episode, dict) and episode.get("still") and not os.path.isfile(str(episode["still"])):
+                episode["still"] = ""
         return stored
 
-    def ensure(self, media_type: str, imdb_id: str, *, refresh: bool = False) -> dict[str, Any] | None:
+    def ensure(
+        self,
+        media_type: str,
+        imdb_id: str,
+        *,
+        refresh: bool = False,
+        episodes: Iterable[tuple[int, int]] = (),
+    ) -> dict[str, Any] | None:
         """Stored details, fetched first when missing, incomplete or older than a week.
+
+        [episodes] are the (season, episode) pairs that are on the device: each of those gets
+        a still saved next to the details, and stills of episodes that are gone are removed.
 
         Without a network this returns whatever is stored (possibly nothing)."""
         folder = self._dir(imdb_id)
         if folder is None:
             return None
+        wanted = set(episodes)
         with self._lock(imdb_id):
             stored = self.load(imdb_id)
-            if stored is not None and not refresh and _is_fresh(stored):
+            if stored is not None and not refresh and _is_fresh(stored) and _describes(stored, wanted):
+                if self._sync_stills(folder, stored, wanted):
+                    _write_json(folder / "meta.json", stored)
                 return stored
             try:
                 fresh = details(media_type, imdb_id, refresh=refresh or stored is not None)
@@ -293,9 +322,63 @@ class MetaStore:
                         fresh[key] = ""
                         continue
                 fresh[key] = str(target)
+            self._sync_stills(folder, fresh, wanted)
             fresh["fetched_at"] = time.time()
             _write_json(folder / "meta.json", fresh)
             return fresh
+
+    def _sync_stills(self, folder: Path, stored: dict[str, Any], wanted: set[tuple[int, int]]) -> bool:
+        """Saves a still for every episode in [wanted] and drops the stills of all others.
+
+        Each episode of [stored] gets `still`: the path of its saved image, or "". Returns
+        whether [stored] changed. A still that could not be fetched is tried again later, not
+        on every look at the library."""
+        stills = folder / "stills"
+        now = time.time()
+        changed = False
+        missing: list[tuple[dict[str, Any], Path]] = []
+        for episode in stored.get("episodes") or []:
+            key = (episode.get("season"), episode.get("episode"))
+            target = stills / f"{key[0]}x{key[1]}.img"
+            value = ""
+            if key in wanted:
+                if target.is_file():
+                    value = str(target)
+                elif episode.get("thumbnail") and not 0 <= now - float(episode.get("still_tried_at") or 0) < _ARTWORK_RETRY_SECONDS:
+                    missing.append((episode, target))
+            if value != str(episode.get("still") or ""):
+                episode["still"] = value
+                changed = True
+
+        keep = {f"{season}x{number}.img" for season, number in wanted}
+        try:
+            for path in stills.iterdir():
+                if path.name not in keep:
+                    path.unlink(missing_ok=True)
+        except OSError:
+            pass  # no stills folder yet
+
+        if not missing:
+            return changed
+        try:
+            stills.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            return changed
+
+        def fetch(item: tuple[dict[str, Any], Path]) -> bool:
+            # The list shows them small; the full-size still is five times the bytes.
+            url = str(item[0]["thumbnail"]).replace("/w780.jpg", "/w500.jpg")
+            return _download(url, item[1], timeout=_STILL_TIMEOUT)
+
+        with ThreadPoolExecutor(max_workers=_STILL_WORKERS) as pool:
+            saved = list(pool.map(fetch, missing))
+        for (episode, target), ok in zip(missing, saved):
+            if ok:
+                episode["still"] = str(target)
+                episode.pop("still_tried_at", None)
+            else:
+                episode["still_tried_at"] = now
+        return True
 
     def remove(self, imdb_id: str) -> None:
         folder = self._dir(imdb_id)
@@ -324,14 +407,25 @@ def _is_fresh(stored: dict[str, Any]) -> bool:
     return 0 <= age < (_STORE_TTL_SECONDS if complete else _ARTWORK_RETRY_SECONDS)
 
 
-def _download(url: str, target: Path) -> bool:
+def _describes(stored: dict[str, Any], wanted: set[tuple[int, int]]) -> bool:
+    """Whether the stored episodes in [wanted] carry what the library shows of them.
+
+    Details saved by an older version of the app have no overview or still address."""
+    return all(
+        "overview" in episode
+        for episode in stored.get("episodes") or []
+        if (episode.get("season"), episode.get("episode")) in wanted
+    )
+
+
+def _download(url: str, target: Path, timeout: float = _ARTWORK_TIMEOUT) -> bool:
     """Saves an image next to the details. False when there was nothing usable to save."""
     if not url.startswith(("http://", "https://")):
         return False
     temp = target.with_name(target.name + ".tmp")
     try:
         request = Request(url, headers={"User-Agent": USER_AGENT})
-        with urlopen(request, timeout=_ARTWORK_TIMEOUT) as response:
+        with urlopen(request, timeout=timeout) as response:
             data = response.read(_ARTWORK_MAX_BYTES + 1)
         if not data or len(data) > _ARTWORK_MAX_BYTES:
             return False
