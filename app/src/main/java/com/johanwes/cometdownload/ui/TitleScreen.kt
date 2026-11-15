@@ -1,6 +1,7 @@
 package com.johanwes.cometdownload.ui
 
 import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.tween
 import androidx.compose.animation.animateColorAsState
 import com.johanwes.cometdownload.releaseTags
 import androidx.compose.material3.rememberModalBottomSheetState
@@ -773,14 +774,16 @@ private fun LazyListScope.streamItems(
                         providerLabel = viewModel.settings.provider.label,
                         onQueue = { viewModel.enqueue(stream) },
                         onShowDownloads = viewModel::showDownloads,
-                        modifier = Modifier.animateItem().padding(horizontal = 16.dp),
+                        // Rows that are new wait for the ones they push down to be out of the way.
+                        modifier = Modifier.animateItem(fadeInSpec = RowFadeIn).padding(horizontal = 16.dp),
                     )
                 }
                 if (group.size > shown.size) {
                     item(key = "more-$resolution") {
                         TextButton(
                             onClick = { onExpand(resolution) },
-                            modifier = Modifier.animateItem().padding(start = 8.dp),
+                            // Gone at once: the first of the rows it asked for takes its place.
+                            modifier = Modifier.animateItem(fadeOutSpec = null).padding(start = 8.dp),
                         ) { Text("Show ${group.size - shown.size} more $resolution") }
                     }
                 }
@@ -788,6 +791,8 @@ private fun LazyListScope.streamItems(
         }
     }
 }
+
+private val RowFadeIn = tween<Float>(durationMillis = 200, delayMillis = 110)
 
 @OptIn(ExperimentalLayoutApi::class)
 @Composable
