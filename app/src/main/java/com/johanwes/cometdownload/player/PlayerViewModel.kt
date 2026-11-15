@@ -131,6 +131,8 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
         private set
     var subtitleScale by mutableFloatStateOf(store.subtitleScale)
         private set
+    var subtitleStyle by mutableStateOf(store.subtitleStyle)
+        private set
 
     // Finding more subtitles online
     var languages by mutableStateOf(emptyList<SubtitleLanguage>())
@@ -346,6 +348,11 @@ class PlayerViewModel(application: Application) : AndroidViewModel(application),
     fun changeSubtitleScale(value: Float) {
         subtitleScale = value.coerceIn(MIN_SUBTITLE_SCALE, MAX_SUBTITLE_SCALE)
         store.subtitleScale = subtitleScale
+    }
+
+    fun changeSubtitleStyle(value: SubtitleStyle) {
+        subtitleStyle = value.copy(border = value.border.coerceIn(0, SubtitleStyle.MAX_BORDER))
+        store.subtitleStyle = subtitleStyle
     }
 
     fun dismissSubtitleNotice() {

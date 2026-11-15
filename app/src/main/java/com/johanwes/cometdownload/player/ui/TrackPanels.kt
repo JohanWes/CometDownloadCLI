@@ -7,6 +7,8 @@ import androidx.compose.animation.slideInHorizontally
 import androidx.compose.animation.slideInVertically
 import androidx.compose.animation.slideOutHorizontally
 import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.interaction.MutableInteractionSource
 import androidx.compose.foundation.layout.Arrangement
@@ -36,9 +38,14 @@ import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.itemsIndexed
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.selection.selectable
+import androidx.compose.foundation.selection.selectableGroup
+import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.Check
+import androidx.compose.material.icons.filled.ExpandLess
+import androidx.compose.material.icons.filled.ExpandMore
 import androidx.compose.material.icons.outlined.CheckCircle
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material3.CircularProgressIndicator
@@ -56,6 +63,11 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.semantics.Role
+import androidx.compose.ui.semantics.contentDescription
+import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.layout.onSizeChanged
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.IntSize
@@ -63,8 +75,10 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.johanwes.cometdownload.Load
 import com.johanwes.cometdownload.OnlineSubtitle
+import com.johanwes.cometdownload.player.NamedColor
 import com.johanwes.cometdownload.player.PlayerViewModel
 import com.johanwes.cometdownload.player.SubtitleSelection
+import com.johanwes.cometdownload.player.SubtitleStyle
 import com.johanwes.cometdownload.ui.Stepper
 import com.johanwes.cometdownload.ui.Tag
 import kotlinx.coroutines.delay
@@ -134,7 +148,7 @@ fun PanelHost(
 }
 
 @Composable
-fun SubtitlesPanel(viewModel: PlayerViewModel) {
+fun SubtitlesPanel(viewModel: PlayerViewModel, styling: Boolean, onStyling: (Boolean) -> Unit) {
     LaunchedEffect(viewModel.current) { viewModel.ensureOnlineSearch() }
     LaunchedEffect(viewModel.subtitleNotice) {
         if (viewModel.subtitleNotice != null) {
@@ -189,6 +203,60 @@ fun SubtitlesPanel(viewModel: PlayerViewModel) {
                         onIncrement = { viewModel.changeSubtitleScale(viewModel.subtitleScale + SCALE_STEP) },
                         canDecrement = viewModel.subtitleScale > PlayerViewModel.MIN_SUBTITLE_SCALE + 0.01f,
                     )
+                }
+            }
+            item(key = "look") {
+                Row(
+                    Modifier
+                        .fillMaxWidth()
+                        .clickable(
+                            onClickLabel = if (styling) "Hide text and border options" else "Show text and border options",
+                        ) { onStyling(!styling) }
+                        .padding(horizontal = 20.dp, vertical = 10.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        "Text and border",
+                        style = MaterialTheme.typography.labelLarge,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.weight(1f),
+                    )
+                    Icon(
+                        if (styling) Icons.Filled.ExpandLess else Icons.Filled.ExpandMore,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    )
+                }
+            }
+            if (styling) {
+                item(key = "style") {
+                    val style = viewModel.subtitleStyle
+                    Column(
+                        Modifier.fillMaxWidth().padding(start = 20.dp, end = 20.dp, bottom = 12.dp),
+                        verticalArrangement = Arrangement.spacedBy(14.dp),
+                    ) {
+                        Swatches(
+                            label = "Text colour",
+                            colors = SubtitleStyle.TEXT_COLORS,
+                            selected = style.textColor,
+                            onPick = { viewModel.changeSubtitleStyle(style.copy(textColor = it)) },
+                        )
+                        Stepper(
+                            label = "Border",
+                            value = if (style.border == 0) "Off" else style.border.toString(),
+                            onDecrement = { viewModel.changeSubtitleStyle(style.copy(border = style.border - 1)) },
+                            onIncrement = { viewModel.changeSubtitleStyle(style.copy(border = style.border + 1)) },
+                            canDecrement = style.border > 0,
+                        )
+                        if (style.border > 0) {
+                            Swatches(
+                                label = "Border colour",
+                                colors = SubtitleStyle.BORDER_COLORS,
+                                selected = style.borderColor,
+                                onPick = { viewModel.changeSubtitleStyle(style.copy(borderColor = it)) },
+                            )
+                        }
+                    }
                 }
             }
         }
@@ -280,6 +348,37 @@ fun SubtitlesPanel(viewModel: PlayerViewModel) {
                         busy = viewModel.downloading == subtitle.fileId,
                         enabled = viewModel.downloading == null,
                         onClick = { viewModel.useOnline(subtitle) },
+                    )
+                }
+            }
+        }
+    }
+}
+
+/** A row of colours to pick one from. */
+@Composable
+private fun Swatches(label: String, colors: List<NamedColor>, selected: Int, onPick: (Int) -> Unit) {
+    val scheme = MaterialTheme.colorScheme
+    Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
+        Text(label, style = MaterialTheme.typography.labelMedium, color = scheme.onSurfaceVariant)
+        Row(Modifier.selectableGroup(), horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            colors.forEach { color ->
+                val chosen = color.argb == selected
+                Box(
+                    Modifier
+                        .size(40.dp)
+                        .clip(CircleShape)
+                        .selectable(selected = chosen, role = Role.RadioButton) { onPick(color.argb) }
+                        .then(if (chosen) Modifier.border(2.dp, scheme.primary, CircleShape) else Modifier)
+                        .semantics { contentDescription = color.name },
+                    contentAlignment = Alignment.Center,
+                ) {
+                    // The thin ring keeps black and dark colours visible on the dark panel.
+                    Box(
+                        Modifier
+                            .size(26.dp)
+                            .background(Color(color.argb), CircleShape)
+                            .border(1.dp, scheme.outline, CircleShape),
                     )
                 }
             }

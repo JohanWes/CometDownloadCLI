@@ -2,7 +2,6 @@ package com.johanwes.cometdownload.player.ui
 
 import android.app.Activity
 import android.content.Context
-import android.graphics.Typeface
 import android.media.AudioManager
 import android.provider.Settings
 import androidx.activity.compose.BackHandler
@@ -76,12 +75,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.viewinterop.AndroidView
 import androidx.media3.common.text.Cue
 import androidx.media3.common.util.UnstableApi
-import androidx.media3.ui.CaptionStyleCompat
 import androidx.media3.ui.SubtitleView
 import androidx.media3.ui.compose.ContentFrame
 import androidx.media3.ui.compose.SURFACE_TYPE_SURFACE_VIEW
 import com.johanwes.cometdownload.player.PlayerViewModel
 import com.johanwes.cometdownload.player.SEEK_STEP_MS
+import com.johanwes.cometdownload.player.SubtitleStyle
 import com.johanwes.cometdownload.player.openInOtherApp
 import kotlinx.coroutines.delay
 import kotlin.math.abs
@@ -109,6 +108,8 @@ fun PlayerScreen(viewModel: PlayerViewModel, onClose: () -> Unit) {
     var titleCard by remember { mutableStateOf(false) }
     var screenSize by remember { mutableStateOf(IntSize.Zero) }
     var panelSize by remember { mutableStateOf(IntSize.Zero) }
+    // The look of the subtitles is being changed, so there has to be a line to look at.
+    var styling by remember { mutableStateOf(false) }
     // Bumped on every touch of the controls, which restarts the auto-hide countdown.
     var interactions by remember { mutableIntStateOf(0) }
     var feedback by remember { mutableStateOf<Feedback?>(null) }
@@ -164,6 +165,7 @@ fun PlayerScreen(viewModel: PlayerViewModel, onClose: () -> Unit) {
     // While subtitles are being adjusted they have to stay in view: beside the panel in
     // landscape (the text moves over), above it in portrait (the picture moves up with it).
     val adjusting = panel == Panel.Subtitles
+    if (!adjusting) styling = false
     val landscape = screenSize.width > screenSize.height
     val (besidePanel, abovePanel) = with(LocalDensity.current) {
         when {
@@ -201,9 +203,11 @@ fun PlayerScreen(viewModel: PlayerViewModel, onClose: () -> Unit) {
             )
 
             SubtitleLayer(
-                cues = viewModel.cues,
+                cues = if (styling && viewModel.cues.isEmpty()) SampleCues else viewModel.cues,
+                style = viewModel.subtitleStyle,
                 videoAspect = viewModel.videoAspect,
                 scale = viewModel.subtitleScale,
+                zoomed = viewModel.zoomed,
                 raised = controlsVisible && panel == null,
                 covered = besidePanel,
             )
@@ -269,7 +273,7 @@ fun PlayerScreen(viewModel: PlayerViewModel, onClose: () -> Unit) {
 
         PanelHost(panel = panel, onDismiss = { panel = null }, onSize = { panelSize = it }) { open ->
             when (open) {
-                Panel.Subtitles -> SubtitlesPanel(viewModel)
+                Panel.Subtitles -> SubtitlesPanel(viewModel, styling = styling, onStyling = { styling = it })
                 Panel.Audio -> AudioPanel(viewModel)
                 Panel.Chapters -> ChaptersPanel(viewModel, onPicked = { panel = null })
                 Panel.Speed -> SpeedPanel(viewModel)
@@ -282,43 +286,59 @@ fun PlayerScreen(viewModel: PlayerViewModel, onClose: () -> Unit) {
  * Subtitles over the picture. Picture-based ones (PGS, styled ASS) are drawn for the exact video
  * area; plain text gets at least a 16:9 box, so it keeps a readable size on very wide films.
  *
+ * When the picture is [zoomed] to fill a screen that is taller than it (an unfolded foldable, a
+ * tablet), the subtitles follow its lower edge down: at the size they had, and as far above the
+ * edge, measured against the height of the picture, as before.
+ *
  * [covered] is how much of the right side a panel hides. The subtitles move into what is left:
  * text keeps its size and wraps sooner, pictures get smaller as a whole.
  */
 @OptIn(UnstableApi::class)
 @Composable
-private fun SubtitleLayer(cues: List<Cue>, videoAspect: Float, scale: Float, raised: Boolean, covered: Dp) {
-    val pictures = cues.any { it.bitmap != null }
-    val aspect = (if (pictures) videoAspect else minOf(videoAspect, 16f / 9f)).coerceIn(0.2f, 5f)
+private fun SubtitleLayer(
+    cues: List<Cue>,
+    style: SubtitleStyle,
+    videoAspect: Float,
+    scale: Float,
+    zoomed: Boolean,
+    raised: Boolean,
+    covered: Dp,
+) {
+    val pictures = cues.filter { it.bitmap != null }
+    val texts = cues.filter { it.bitmap == null && !it.text.isNullOrEmpty() }
+    val pictureAspect = videoAspect.coerceIn(0.2f, 5f)
+    val textAspect = minOf(pictureAspect, 16f / 9f)
     BoxWithConstraints(Modifier.fillMaxSize()) {
-        // The box as it fits the screen, then narrowed to the part that is in view.
-        val fitWidth = minOf(maxWidth, maxHeight * aspect)
-        val inView = (maxWidth - covered).coerceAtLeast(0.dp)
-        val width = minOf(fitWidth, inView)
-        val height = if (pictures) width / aspect else fitWidth / aspect
-        Box(Modifier.width(inView).fillMaxHeight(), contentAlignment = Alignment.Center) {
+        val boxWidth = maxWidth
+        val boxHeight = maxHeight
+        val inView = (boxWidth - covered).coerceAtLeast(0.dp)
+        Box(
+            Modifier.width(inView).fillMaxHeight(),
+            // A picture that fills the screen leaves no bars for the subtitles to stay out of.
+            contentAlignment = if (zoomed) Alignment.BottomCenter else Alignment.Center,
+        ) {
+            val pictureWidth = minOf(boxWidth, boxHeight * pictureAspect, inView)
+            val pictureHeight = pictureWidth / pictureAspect
+            // Pictures keep their size; raised a little, so their distance to the edge grows
+            // with the picture the way it does for text.
+            val lift = if (zoomed) (boxHeight - pictureHeight).coerceAtLeast(0.dp) * SubtitleView.DEFAULT_BOTTOM_PADDING_FRACTION else 0.dp
             AndroidView(
-                factory = { context ->
-                    SubtitleView(context).apply {
-                        setStyle(
-                            CaptionStyleCompat(
-                                android.graphics.Color.WHITE,
-                                android.graphics.Color.TRANSPARENT,
-                                android.graphics.Color.TRANSPARENT,
-                                CaptionStyleCompat.EDGE_TYPE_OUTLINE,
-                                android.graphics.Color.BLACK,
-                                Typeface.create("sans-serif-medium", Typeface.NORMAL),
-                            ),
-                        )
-                    }
-                },
-                update = { view ->
-                    view.setFractionalTextSize(SubtitleView.DEFAULT_TEXT_SIZE_FRACTION * scale)
-                    // Clear of the seek bar while the controls are up.
-                    view.setBottomPaddingFraction(if (raised) RAISED_SUBTITLE_PADDING else SubtitleView.DEFAULT_BOTTOM_PADDING_FRACTION)
-                    view.setCues(cues)
-                },
-                modifier = Modifier.size(width, height),
+                factory = { context -> SubtitleView(context) },
+                update = { view -> view.setCues(pictures) },
+                modifier = Modifier.padding(bottom = lift).size(pictureWidth, pictureHeight),
+            )
+
+            // The box as it fits the screen, then narrowed to the part that is in view.
+            val fitWidth = minOf(boxWidth, boxHeight * textAspect)
+            val fitHeight = fitWidth / textAspect
+            TextCues(
+                cues = texts,
+                style = style,
+                // Sized for the fitted box either way, so filling the screen doesn't enlarge it.
+                textSize = fitHeight * (SubtitleView.DEFAULT_TEXT_SIZE_FRACTION * scale),
+                // Clear of the seek bar while the controls are up.
+                bottomPadding = if (raised) RAISED_SUBTITLE_PADDING else SubtitleView.DEFAULT_BOTTOM_PADDING_FRACTION,
+                modifier = Modifier.size(minOf(fitWidth, inView), if (zoomed) boxHeight else fitHeight),
             )
         }
     }
@@ -539,4 +559,5 @@ private const val TITLE_CARD_FADE_MS = 500
 private const val SKIP_FEEDBACK_MS = 700L
 private const val FEEDBACK_MS = 900L
 private const val RAISED_SUBTITLE_PADDING = 0.3f
+private val SampleCues = listOf(Cue.Builder().setText("This is how subtitles look").build())
 private const val EDGE_GUARD_DP = 40

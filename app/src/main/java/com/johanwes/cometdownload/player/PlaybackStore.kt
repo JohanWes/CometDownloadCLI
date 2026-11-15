@@ -81,6 +81,21 @@ class PlaybackStore(context: Context) {
         get() = prefs.getFloat(KEY_SUBTITLE_SCALE, 1f)
         set(value) = prefs.edit().putFloat(KEY_SUBTITLE_SCALE, value).apply()
 
+    /** How subtitle text looks, shared by all videos. */
+    var subtitleStyle: SubtitleStyle
+        get() = SubtitleStyle().let { default ->
+            SubtitleStyle(
+                textColor = prefs.getInt(KEY_SUBTITLE_TEXT_COLOR, default.textColor),
+                borderColor = prefs.getInt(KEY_SUBTITLE_BORDER_COLOR, default.borderColor),
+                border = prefs.getInt(KEY_SUBTITLE_BORDER, default.border),
+            )
+        }
+        set(value) = prefs.edit()
+            .putInt(KEY_SUBTITLE_TEXT_COLOR, value.textColor)
+            .putInt(KEY_SUBTITLE_BORDER_COLOR, value.borderColor)
+            .putInt(KEY_SUBTITLE_BORDER, value.border)
+            .apply()
+
     /** Forgets videos that no longer exist, so the store doesn't grow forever. */
     fun prune() {
         val gone = prefs.all.keys.filter { it.startsWith("/") && !File(it).exists() }
@@ -89,6 +104,9 @@ class PlaybackStore(context: Context) {
 
     private companion object {
         const val KEY_SUBTITLE_SCALE = "#subtitle_scale"
+        const val KEY_SUBTITLE_TEXT_COLOR = "#subtitle_text_color"
+        const val KEY_SUBTITLE_BORDER_COLOR = "#subtitle_border_color"
+        const val KEY_SUBTITLE_BORDER = "#subtitle_border"
         const val WATCHED_FRACTION = 0.95
         const val WATCHED_TAIL_MS = 30_000L
         const val MIN_RESUME_MS = 15_000L
